@@ -1,2 +1,3 @@
-python-telegram-bot
-requests 
+aiogram
+openai==0.28
+python-dotenv
