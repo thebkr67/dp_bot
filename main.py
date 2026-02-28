@@ -300,6 +300,8 @@ async def helper(message: Message):
         "/make_xlsx <что должно быть в таблице>\n"
         "/make_docx <что должно быть в документе>\n"
         "/make_txt <что должно быть в тексте>\n"
+        "/search <запрос> поиск\n"
+        "/research <запрос> поиск и сводка от ИИ\n"
     )
 
 
