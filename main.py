@@ -47,7 +47,7 @@ def clear_past():
 # ---------- handlers ----------
 @dp.message(Command("start"))
 async def welcome(message: Message):
-    await message.answer("Hi\nI am here to help you.\nCreated by thebkr")
+    await message.answer("Добрый день, я Альтереччи, я создан, чтобы служить")
 
 
 @dp.message(Command("help"))
