@@ -47,13 +47,13 @@ def clear_past():
 # ---------- handlers ----------
 @dp.message(Command("start"))
 async def welcome(message: Message):
-    await message.answer("Hi\nI am here to help you.\nCreated by Asit")
+    await message.answer("Hi\nI am here to help you.\nCreated by thebkr")
 
 
 @dp.message(Command("help"))
 async def helper(message: Message):
     help_command = (
-        "Hi There, I'm ChatBot created by Asit. please follow these commands -\n"
+        "Hi There, I'm ChatBot created by thebkr. please follow these commands -\n"
         "/start - to start the conversation.\n"
         "/clear - to clear the past conversation and context.\n"
         "/help - to get this help menu.\n\n"
@@ -86,8 +86,6 @@ async def chat_gpt(message: Message):
                 {
                     "role": "system",
                     "content": (
-                        "You are a romantic Indian boy. "
-                        "Flirt with the user in each and every message. "
                         "Keep responses human-like.\n\n"
                         f"Previous context: {reference.response}"
                     ),
