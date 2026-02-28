@@ -354,10 +354,7 @@ async def _edit_xlsx_bytes(data: bytes, instructions: str) -> Tuple[bytes, str]:
 @dp.message(Command("start"))
 async def welcome(message: Message):
     await message.answer(
-        "Пришли файл (xlsx/docx/txt/pdf/…) или фото — разберу.\n\n"
-        "✅ Редактирование: пришли файл → затем /edit что изменить\n"
-        "✅ Создание файлов: /make_xlsx, /make_docx, /make_txt\n"
-        "✅ Автопоиск: просто напиши 'найди/ссылки/актуально/что сейчас…' — сам поищу в интернете"
+        "Привет, я Альтератти, бот, созданный thebkr.\n"
     )
 
 
