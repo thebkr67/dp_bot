@@ -1,8 +1,8 @@
 import logging
-from aiogram import Bot, Dispatcher, executor, types
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils import executor
 from dotenv import load_dotenv
 import os
-import sys
 import openai
 
 load_dotenv()
