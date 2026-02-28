@@ -6,6 +6,7 @@ import base64
 import logging
 import asyncio
 import httpx
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -43,7 +44,22 @@ dp = Dispatcher()
 TEXT_MODEL = "gpt-4o-mini"
 VISION_MODEL = "gpt-4o-mini"
 
-MAX_FILE_BYTES = 12 * 1024 * 1024  # 12 MB: безопасный лимит под Telegram/Railway
+MAX_FILE_BYTES = 12 * 1024 * 1024  # 12 MB
+
+# ---------- autosearch settings ----------
+SEARCH_TRIGGERS = [
+    "найди", "поищи", "поиск", "в интернете", "гугл", "google",
+    "ссылк", "источник", "пруф", "докажи", "где написано",
+    "актуаль", "сейчас", "на сегодня", "последн", "свеж",
+    "новост", "цена", "стоимость", "тариф", "курс", "ставк",
+    "правила", "регламент", "инструкция", "политика", "обновил",
+    "railway", "serper", "aiogram", "wildberries", "ozon"
+]
+
+SEARCH_MIN_LEN = 18               # минимальная длина сообщения для автопоиска
+SEARCH_RESULTS_NUM = 5            # сколько результатов подмешивать
+SEARCH_COOLDOWN_SEC = 12          # 1 поиск / 12 сек на пользователя
+SEARCH_CACHE_TTL_SEC = 300        # кэш выдачи на 5 минут
 
 
 class Reference:
@@ -70,7 +86,39 @@ class LastFile:
 last_files: dict[int, LastFile] = {}  # key = telegram user_id
 
 
-# ---------- helpers ----------
+# ---------- autosearch state ----------
+_last_search_at: dict[int, float] = {}
+_search_cache: dict[str, tuple[float, list[dict]]] = {}
+
+
+def should_autosearch(text: str) -> bool:
+    """
+    Решаем, нужен ли автопоиск.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if t.startswith("/"):
+        return False  # команды не трогаем
+    if len(t) < SEARCH_MIN_LEN:
+        return False
+    return any(k in t for k in SEARCH_TRIGGERS)
+
+
+def can_search_now(user_id: int) -> bool:
+    now = time.time()
+    last = _last_search_at.get(user_id, 0.0)
+    if now - last < SEARCH_COOLDOWN_SEC:
+        return False
+    _last_search_at[user_id] = now
+    return True
+
+
+def _cache_key(query: str, num: int) -> str:
+    q = re.sub(r"\s+", " ", (query or "").strip().lower())
+    return f"{q}::num={num}"
+
+
 async def serper_search(query: str, num: int = 5) -> list[dict]:
     """
     Возвращает список результатов: title, link, snippet
@@ -85,8 +133,8 @@ async def serper_search(query: str, num: int = 5) -> list[dict]:
     }
     payload = {"q": query, "num": max(1, min(num, 10))}
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(url, headers=headers, json=payload)
+    async with httpx.AsyncClient(timeout=20) as client_http:
+        r = await client_http.post(url, headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
 
@@ -99,11 +147,44 @@ async def serper_search(query: str, num: int = 5) -> list[dict]:
         })
     return results
 
+
+async def serper_search_cached(query: str, num: int = 5) -> list[dict]:
+    """
+    Кэшируем поиск, чтобы не жечь лимиты.
+    """
+    key = _cache_key(query, num)
+    now = time.time()
+
+    if key in _search_cache:
+        ts, cached = _search_cache[key]
+        if now - ts < SEARCH_CACHE_TTL_SEC:
+            return cached
+
+    results = await serper_search(query, num=num)
+    _search_cache[key] = (now, results)
+    return results
+
+
 def format_search_results(results: list[dict]) -> str:
     text = "🔎 Результаты поиска:\n\n"
     for i, r in enumerate(results, start=1):
         text += f"{i}) {r.get('title','')}\n{r.get('link','')}\n{r.get('snippet','')}\n\n"
     return text.strip()
+
+
+def format_results_for_prompt(results: list[dict]) -> str:
+    # компактный блок для промпта модели
+    lines = []
+    for r in results:
+        title = (r.get("title") or "").strip()
+        snippet = (r.get("snippet") or "").strip()
+        link = (r.get("link") or "").strip()
+        if title or snippet or link:
+            lines.append(f"- {title}: {snippet} ({link})")
+    return "\n".join(lines).strip()
+
+
+# ---------- helpers ----------
 def _ext(filename: Optional[str]) -> str:
     if not filename:
         return ""
@@ -215,7 +296,6 @@ def _save_bytes_to_tmp(filename: str, data: bytes) -> str:
 # ---------- file building ----------
 def _build_docx_from_text(text: str) -> bytes:
     doc = DocxDocument()
-    # сохраняем абзацы по переносам
     for para in (text or "").splitlines():
         doc.add_paragraph(para)
     out = io.BytesIO()
@@ -249,20 +329,13 @@ async def _edit_text_like(original_text: str, instructions: str) -> str:
 
 
 async def _edit_docx_bytes(data: bytes, instructions: str) -> Tuple[bytes, str]:
-    # Важно: это “умное” редактирование текста, но форматирование docx может упроститься.
     src = _extract_text_from_docx(data)
     edited = await _edit_text_like(src, instructions)
     return _build_docx_from_text(edited), "docx"
 
 
 async def _edit_xlsx_bytes(data: bytes, instructions: str) -> Tuple[bytes, str]:
-    """
-    Для xlsx делаем безопасный режим: модель возвращает TSV всей таблицы (первые N строк),
-    мы строим новый xlsx. Это надёжнее, чем пытаться “сохранить форматирование”.
-    Если нужно сохранить формулы/стили — скажи, добавлю diff-режим по ячейкам.
-    """
     preview = _extract_tsv_preview_from_xlsx(data, max_rows=120, max_cols=25)
-
     system = (
         "Ты ассистент по таблицам. Тебе дают TSV-таблицу (таб-разделители) и инструкцию, что изменить. "
         "Верни ТОЛЬКО итоговый TSV (табами, строки переносами), без пояснений, без markdown."
@@ -283,7 +356,8 @@ async def welcome(message: Message):
     await message.answer(
         "Пришли файл (xlsx/docx/txt/pdf/…) или фото — разберу.\n\n"
         "✅ Редактирование: пришли файл → затем /edit что изменить\n"
-        "✅ Создание файлов: /make_xlsx, /make_docx, /make_txt"
+        "✅ Создание файлов: /make_xlsx, /make_docx, /make_txt\n"
+        "✅ Автопоиск: просто напиши 'найди/ссылки/актуально/что сейчас…' — сам поищу в интернете"
     )
 
 
@@ -299,9 +373,10 @@ async def helper(message: Message):
         "Создание файлов:\n"
         "/make_xlsx <что должно быть в таблице>\n"
         "/make_docx <что должно быть в документе>\n"
-        "/make_txt <что должно быть в тексте>\n"
-        "/search <запрос> поиск\n"
-        "/research <запрос> поиск и сводка от ИИ\n"
+        "/make_txt <что должно быть в тексте>\n\n"
+        "Интернет-поиск без команд:\n"
+        "Напиши в обычном сообщении: 'найди …', 'дай ссылки …', 'что сейчас …', 'актуальные правила …' — я сам поищу.\n\n"
+        "Команды поиска (если всё же надо): /search и /research"
     )
 
 
@@ -309,6 +384,10 @@ async def helper(message: Message):
 async def clear(message: Message):
     clear_past()
     await message.answer("Ок, очистил контекст.")
+
+
+# --- твои /edit /make_* /search /research и обработчики файлов ниже ОСТАЮТСЯ ---
+# (Я их не вырезал — они у тебя уже есть.)
 
 
 @dp.message(Command("edit"))
@@ -354,7 +433,6 @@ async def edit_last_file(message: Message, bot: Bot):
             return
 
         if ext == ".pdf":
-            # PDF править сложно: отдаём docx с правками
             src = _extract_text_from_pdf(lf.data, max_pages=10)
             edited = await _edit_text_like(src, instructions)
             out_bytes = _build_docx_from_text(edited)
@@ -423,6 +501,8 @@ async def make_txt(message: Message):
     out_name = "generated.txt"
     path = _save_bytes_to_tmp(out_name, out_bytes)
     await message.answer_document(FSInputFile(path), caption="Сгенерировал TXT.")
+
+
 @dp.message(Command("search"))
 async def cmd_search(message: Message):
     q = (message.text or "").replace("/search", "", 1).strip()
@@ -431,7 +511,7 @@ async def cmd_search(message: Message):
         return
 
     try:
-        results = await serper_search(q, num=5)
+        results = await serper_search_cached(q, num=SEARCH_RESULTS_NUM)
     except Exception as e:
         await message.answer(f"Ошибка поиска: {e}")
         return
@@ -451,7 +531,7 @@ async def cmd_research(message: Message):
         return
 
     try:
-        results = await serper_search(q, num=5)
+        results = await serper_search_cached(q, num=SEARCH_RESULTS_NUM)
     except Exception as e:
         await message.answer(f"Ошибка поиска: {e}")
         return
@@ -460,19 +540,15 @@ async def cmd_research(message: Message):
         await message.answer("Ничего не нашёл. Попробуй переформулировать запрос.")
         return
 
-    # 1) показать ссылки
     listing = format_search_results(results)
     await message.answer(listing)
 
-    # 2) сделать сводку моделью (по сниппетам)
     system = (
         "Ты делаешь краткую сводку по результатам интернет-поиска. "
         "Сначала 3-7 буллетов с выводами, затем 'Что сделать дальше' (3-5 шагов). "
         "Если фактов мало — скажи, чего не хватает."
     )
-    user = "Запрос: " + q + "\n\n" + "\n".join(
-        [f"- {r['title']}: {r['snippet']} ({r['link']})" for r in results]
-    )
+    user = "Запрос: " + q + "\n\n" + format_results_for_prompt(results)
 
     try:
         summary = await _ask_openai_text(system, user)
@@ -480,6 +556,7 @@ async def cmd_research(message: Message):
     except Exception as e:
         logging.exception("OpenAI summary failed")
         await message.answer(f"Не смог сделать сводку: {e}")
+
 
 # ---------- file handlers ----------
 @dp.message(F.photo)
@@ -515,7 +592,6 @@ async def handle_document(message: Message, bot: Bot):
         await message.answer("Файл слишком большой. Пришли поменьше (до ~12MB).")
         return
 
-    # запоминаем как последний файл пользователя
     last_files[message.from_user.id] = LastFile(
         filename=filename,
         ext=ext,
@@ -523,7 +599,6 @@ async def handle_document(message: Message, bot: Bot):
         data=file_bytes,
     )
 
-    # Если caption начинается с "edit:" — сразу применяем правки
     caption = (message.caption or "").strip()
     if caption.lower().startswith("edit:"):
         instructions = caption[5:].strip()
@@ -531,8 +606,6 @@ async def handle_document(message: Message, bot: Bot):
         await edit_last_file(message, bot)
         return
 
-    # Иначе — просто разбор файла (как у тебя было)
-    # 1) Если это картинка — vision
     if ext in {".png", ".jpg", ".jpeg", ".webp"} or mime.startswith("image/"):
         prompt = f"Пользователь прислал изображение файлом: {filename}. Распознай и помоги."
         try:
@@ -546,7 +619,6 @@ async def handle_document(message: Message, bot: Bot):
         await message.answer("Файл запомнил. Если нужно изменить — напиши /edit <что поменять>.")
         return
 
-    # 2) Извлекаем текст/превью
     try:
         if ext == ".pdf":
             extracted = _extract_text_from_pdf(file_bytes, max_pages=10)
@@ -592,18 +664,51 @@ async def chat_gpt(message: Message):
     if not user_text:
         return
 
+    # Команды не трогаем
+    if user_text.startswith("/"):
+        return
+
+    # --- AUT0SEARCH ---
+    search_block = ""
+    used_search = False
+
+    if SERPER_API_KEY and should_autosearch(user_text) and can_search_now(message.from_user.id):
+        try:
+            results = await serper_search_cached(user_text, num=SEARCH_RESULTS_NUM)
+            if results:
+                used_search = True
+                search_block = (
+                    "\n\nРЕЗУЛЬТАТЫ ПОИСКА (snippets):\n"
+                    + format_results_for_prompt(results)
+                    + "\n\nТребование: используй результаты поиска, добавь 2–5 ссылок."
+                )
+        except Exception:
+            logging.exception("Autosearch failed")
+            # падаем обратно на обычный ответ без поиска
+
+    system = (
+        "Отвечай по делу, человеческим языком. "
+        "Если есть блок 'РЕЗУЛЬТАТЫ ПОИСКА' — опирайся на него и добавь ссылки. "
+        "Если данных недостаточно — скажи, чего не хватает и что уточнить."
+    )
+
+    # подмешиваем контекст + результаты поиска
+    user = user_text + search_block
+
     try:
-        answer = await _ask_openai_text(
-            "Отвечай по делу, человеческим языком.",
-            user_text
-        )
+        answer = await _ask_openai_text(system, user)
     except Exception as e:
         logging.exception("OpenAI request failed")
         await message.answer(f"OpenAI error: {e}")
         return
 
     reference.response = answer
-    await message.answer(answer)
+
+    # (опционально) маленький индикатор, что поиск применён
+    if used_search:
+        await message.answer("🌐 Нашёл в интернете, вот по сути:\n\n" + answer)
+    else:
+        await message.answer(answer)
 
 
 # ---------- entrypoint ----------
