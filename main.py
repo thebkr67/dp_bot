@@ -5,6 +5,7 @@ import json
 import base64
 import logging
 import asyncio
+import httpx
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -27,6 +28,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
@@ -69,6 +71,39 @@ last_files: dict[int, LastFile] = {}  # key = telegram user_id
 
 
 # ---------- helpers ----------
+async def serper_search(query: str, num: int = 5) -> list[dict]:
+    """
+    Возвращает список результатов: title, link, snippet
+    """
+    if not SERPER_API_KEY:
+        raise RuntimeError("SERPER_API_KEY is not set")
+
+    url = "https://google.serper.dev/search"
+    headers = {
+        "X-API-KEY": SERPER_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {"q": query, "num": max(1, min(num, 10))}
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+
+    results = []
+    for item in (data.get("organic") or [])[:num]:
+        results.append({
+            "title": item.get("title", ""),
+            "link": item.get("link", ""),
+            "snippet": item.get("snippet", ""),
+        })
+    return results
+
+def format_search_results(results: list[dict]) -> str:
+    text = "🔎 Результаты поиска:\n\n"
+    for i, r in enumerate(results, start=1):
+        text += f"{i}) {r.get('title','')}\n{r.get('link','')}\n{r.get('snippet','')}\n\n"
+    return text.strip()
 def _ext(filename: Optional[str]) -> str:
     if not filename:
         return ""
@@ -386,7 +421,63 @@ async def make_txt(message: Message):
     out_name = "generated.txt"
     path = _save_bytes_to_tmp(out_name, out_bytes)
     await message.answer_document(FSInputFile(path), caption="Сгенерировал TXT.")
+@dp.message(Command("search"))
+async def cmd_search(message: Message):
+    q = (message.text or "").replace("/search", "", 1).strip()
+    if not q:
+        await message.answer("Напиши так: /search запрос")
+        return
 
+    try:
+        results = await serper_search(q, num=5)
+    except Exception as e:
+        await message.answer(f"Ошибка поиска: {e}")
+        return
+
+    if not results:
+        await message.answer("Ничего не нашёл. Попробуй переформулировать запрос.")
+        return
+
+    await message.answer(format_search_results(results))
+
+
+@dp.message(Command("research"))
+async def cmd_research(message: Message):
+    q = (message.text or "").replace("/research", "", 1).strip()
+    if not q:
+        await message.answer("Напиши так: /research запрос (я найду и сделаю краткий вывод)")
+        return
+
+    try:
+        results = await serper_search(q, num=5)
+    except Exception as e:
+        await message.answer(f"Ошибка поиска: {e}")
+        return
+
+    if not results:
+        await message.answer("Ничего не нашёл. Попробуй переформулировать запрос.")
+        return
+
+    # 1) показать ссылки
+    listing = format_search_results(results)
+    await message.answer(listing)
+
+    # 2) сделать сводку моделью (по сниппетам)
+    system = (
+        "Ты делаешь краткую сводку по результатам интернет-поиска. "
+        "Сначала 3-7 буллетов с выводами, затем 'Что сделать дальше' (3-5 шагов). "
+        "Если фактов мало — скажи, чего не хватает."
+    )
+    user = "Запрос: " + q + "\n\n" + "\n".join(
+        [f"- {r['title']}: {r['snippet']} ({r['link']})" for r in results]
+    )
+
+    try:
+        summary = await _ask_openai_text(system, user)
+        await message.answer("🧠 Сводка:\n\n" + summary)
+    except Exception as e:
+        logging.exception("OpenAI summary failed")
+        await message.answer(f"Не смог сделать сводку: {e}")
 
 # ---------- file handlers ----------
 @dp.message(F.photo)
