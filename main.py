@@ -38,8 +38,22 @@ DEEPAI_TIMEOUT_SEC = int(os.getenv("DEEPAI_TIMEOUT_SEC", "120"))
 IMG_FALLBACK = os.getenv("IMG_FALLBACK", "openai").lower()  # openai/none
 ENHANCE_DEFAULT_SCALE = int(os.getenv("ENHANCE_DEFAULT_SCALE", "2"))  # 2 or 4
 
+# --- RunwayML (image/text -> video) ---
+# Runway uses Authorization: Bearer <key> and requires X-Runway-Version: 2024-11-06 for v1 endpoints.
+RUNWAYML_API_SECRET = os.getenv("RUNWAYML_API_SECRET") or os.getenv("RUNWAY_API_KEY")
+RUNWAYML_API_BASE = os.getenv("RUNWAYML_API_BASE", "https://api.dev.runwayml.com")
+RUNWAYML_VERSION = os.getenv("RUNWAYML_VERSION", "2024-11-06")
+
+# Defaults (override via env if you want)
+RUNWAY_IMAGE2VIDEO_MODEL = os.getenv("RUNWAY_IMAGE2VIDEO_MODEL", "gen3a_turbo")
+RUNWAY_TEXT2VIDEO_MODEL = os.getenv("RUNWAY_TEXT2VIDEO_MODEL", "gen4.5")
+RUNWAY_DEFAULT_RATIO = os.getenv("RUNWAY_DEFAULT_RATIO", "1280:720")
+RUNWAY_DEFAULT_DURATION = int(os.getenv("RUNWAY_DEFAULT_DURATION", "6"))  # 2..10
+RUNWAY_POLL_INTERVAL_SEC = int(os.getenv("RUNWAY_POLL_INTERVAL_SEC", "5"))  # docs: don't poll > 1/5s
+RUNWAY_TASK_TIMEOUT_SEC = int(os.getenv("RUNWAY_TASK_TIMEOUT_SEC", "600"))
+
 if not DEEPAI_API_KEY:
-    raise RuntimeError("DEEPAI_API_KEY is not set")
+    logging.warning("DEEPAI_API_KEY is not set (DeepAI features disabled)")
 
 
 if not TELEGRAM_BOT_TOKEN:
@@ -99,7 +113,9 @@ last_files: dict[int, LastFile] = {}  # key = telegram user_id
 # ---------- last image storage ----------
 ENHANCE_CB = "enhance:last"
 RETROUCH_CB = "retouch:last"
+VIDEO_CB = "video:last"
 last_images: dict[int, bytes] = {}  # key = telegram user_id
+pending_video_prompt: dict[int, bool] = {}  # user_id -> ждём текст-подсказку для видео
 
 
 # ---------- autosearch state ----------
@@ -374,7 +390,8 @@ def _image_action_keyboard():
     kb = InlineKeyboardBuilder()
     kb.button(text="✨ Улучшить", callback_data=ENHANCE_CB)
     kb.button(text="🛍️ WB ретушь", callback_data=RETROUCH_CB)
-    kb.adjust(2)
+    kb.button(text="🎥 Сделать видео", callback_data=VIDEO_CB)
+    kb.adjust(2, 1)
     return kb.as_markup()
 
 
@@ -494,6 +511,195 @@ async def enhance_image(image_bytes: bytes) -> bytes:
         return img.content
 
 
+# ---------------- RunwayML: image/text -> video ----------------
+# Docs:
+# - POST /v1/image_to_video, POST /v1/text_to_video, GET /v1/tasks/{id}, POST /v1/uploads
+# - X-Runway-Version must be "2024-11-06"
+# - SUCCEEDED task returns "output": [<url>, ...]
+# See official docs: https://docs.dev.runwayml.com/ (API Reference + Output formats)
+
+def _runway_headers() -> dict:
+    if not RUNWAYML_API_SECRET:
+        raise RuntimeError("RUNWAYML_API_SECRET is not set")
+    return {
+        "Authorization": f"Bearer {RUNWAYML_API_SECRET}",
+        "X-Runway-Version": RUNWAYML_VERSION,
+    }
+
+
+async def runway_create_ephemeral_upload(file_bytes: bytes, filename: str) -> str:
+    """
+    Upload bytes as an ephemeral asset and return runway:// URI.
+    This uses POST /v1/uploads to get a presigned uploadUrl + fields, then uploads the file with multipart/form-data.
+    """
+    if not file_bytes:
+        raise ValueError("Empty file_bytes")
+
+    meta_url = f"{RUNWAYML_API_BASE}/v1/uploads"
+    headers = {**_runway_headers(), "Content-Type": "application/json"}
+    payload = {"filename": filename, "type": "ephemeral"}
+
+    async with httpx.AsyncClient(timeout=60) as client_http:
+        r = await client_http.post(meta_url, headers=headers, json=payload)
+        r.raise_for_status()
+        meta = r.json()
+
+    upload_url = meta.get("uploadUrl")
+    fields = meta.get("fields") or {}
+    runway_uri = meta.get("runwayUri")
+
+    if not upload_url or not runway_uri:
+        raise RuntimeError(f"Runway upload init failed: {meta}")
+
+    # Now do the actual upload to the presigned URL
+    # Important: for S3-style presigned POST, fields MUST be included exactly as provided.
+    form = dict(fields)
+    files = {
+        "file": (filename, file_bytes, "application/octet-stream")
+    }
+
+    async with httpx.AsyncClient(timeout=120) as client_http:
+        rr = await client_http.post(upload_url, data=form, files=files)
+        rr.raise_for_status()
+
+    return runway_uri
+
+
+async def runway_submit_image_to_video(
+    prompt_text: str,
+    prompt_image_uri: str,
+    *,
+    model: str = RUNWAY_IMAGE2VIDEO_MODEL,
+    ratio: str = RUNWAY_DEFAULT_RATIO,
+    duration: int = RUNWAY_DEFAULT_DURATION,
+) -> str:
+    url = f"{RUNWAYML_API_BASE}/v1/image_to_video"
+    headers = {**_runway_headers(), "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "promptText": prompt_text,
+        "promptImage": prompt_image_uri,
+        "ratio": ratio,
+        "duration": int(duration),
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client_http:
+        r = await client_http.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+
+    task_id = data.get("id")
+    if not task_id:
+        raise RuntimeError(f"Runway image_to_video failed: {data}")
+    return task_id
+
+
+async def runway_submit_text_to_video(
+    prompt_text: str,
+    *,
+    model: str = RUNWAY_TEXT2VIDEO_MODEL,
+    ratio: str = RUNWAY_DEFAULT_RATIO,
+    duration: int = RUNWAY_DEFAULT_DURATION,
+) -> str:
+    url = f"{RUNWAYML_API_BASE}/v1/text_to_video"
+    headers = {**_runway_headers(), "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "promptText": prompt_text,
+        "ratio": ratio,
+        "duration": int(duration),
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client_http:
+        r = await client_http.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+
+    task_id = data.get("id")
+    if not task_id:
+        raise RuntimeError(f"Runway text_to_video failed: {data}")
+    return task_id
+
+
+async def runway_wait_task_output(task_id: str, *, timeout_sec: int = RUNWAY_TASK_TIMEOUT_SEC) -> list[str]:
+    url = f"{RUNWAYML_API_BASE}/v1/tasks/{task_id}"
+    headers = _runway_headers()
+
+    start = time.time()
+    last_status = None
+
+    async with httpx.AsyncClient(timeout=60) as client_http:
+        while True:
+            r = await client_http.get(url, headers=headers)
+            if r.status_code == 404:
+                raise RuntimeError("Runway task not found (deleted/canceled?)")
+            r.raise_for_status()
+            data = r.json()
+
+            status = data.get("status")
+            if status and status != last_status:
+                last_status = status
+
+            if status == "SUCCEEDED":
+                output = data.get("output") or []
+                if not isinstance(output, list) or not output:
+                    raise RuntimeError(f"Runway task succeeded but has no output: {data}")
+                return output
+            if status in ("FAILED", "CANCELED", "CANCELLED", "ABORTED", "DELETED"):
+                raise RuntimeError(f"Runway task {status}: {data}")
+
+            if time.time() - start > timeout_sec:
+                raise TimeoutError(f"Runway task timeout after {timeout_sec}s (last status: {status})")
+
+            await asyncio.sleep(max(1, RUNWAY_POLL_INTERVAL_SEC))
+
+
+async def runway_download_bytes(url: str) -> bytes:
+    async with httpx.AsyncClient(timeout=180) as client_http:
+        r = await client_http.get(url)
+        r.raise_for_status()
+        return r.content
+
+
+async def runway_image_bytes_to_video(
+    image_bytes: bytes,
+    *,
+    prompt_text: str,
+    filename: str = "input.jpg",
+    model: str = RUNWAY_IMAGE2VIDEO_MODEL,
+    ratio: str = RUNWAY_DEFAULT_RATIO,
+    duration: int = RUNWAY_DEFAULT_DURATION,
+) -> tuple[str, bytes]:
+    """Return (task_id, mp4_bytes)."""
+    runway_uri = await runway_create_ephemeral_upload(image_bytes, filename)
+    task_id = await runway_submit_image_to_video(
+        prompt_text,
+        runway_uri,
+        model=model,
+        ratio=ratio,
+        duration=duration,
+    )
+    outputs = await runway_wait_task_output(task_id)
+    video_url = outputs[0]
+    video_bytes = await runway_download_bytes(video_url)
+    return task_id, video_bytes
+
+
+async def runway_text_to_video(
+    *,
+    prompt_text: str,
+    model: str = RUNWAY_TEXT2VIDEO_MODEL,
+    ratio: str = RUNWAY_DEFAULT_RATIO,
+    duration: int = RUNWAY_DEFAULT_DURATION,
+) -> tuple[str, bytes]:
+    """Return (task_id, mp4_bytes)."""
+    task_id = await runway_submit_text_to_video(prompt_text, model=model, ratio=ratio, duration=duration)
+    outputs = await runway_wait_task_output(task_id)
+    video_url = outputs[0]
+    video_bytes = await runway_download_bytes(video_url)
+    return task_id, video_bytes
+
+
 @dp.message(Command("img"))
 async def cmd_img(message: Message):
     prompt = (message.text or "").replace("/img", "", 1).strip()
@@ -530,6 +736,64 @@ async def cmd_enhance(message: Message):
     except Exception as e:
         logging.exception("DeepAI enhance failed")
         await message.answer(f"Ошибка улучшения: {e}")
+
+
+@dp.message(Command("img2vid"))
+async def cmd_img2vid(message: Message):
+    """
+    /img2vid <описание> — сделать видео из последнего присланного фото.
+    """
+    await _react_ok(message)
+    user_id = message.from_user.id
+    prompt = (message.text or "").replace("/img2vid", "", 1).strip()
+    if not prompt:
+        await message.answer("Напиши так: /img2vid описание (движение/камера/стиль). Или нажми 🎥 под фото.")
+        return
+
+    src = last_images.get(user_id)
+    if not src:
+        await message.answer("Сначала пришли фото, из которого нужно сделать видео.")
+        return
+
+    try:
+        await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
+        task_id, video_bytes = await run_with_thinking(
+            message.bot,
+            message.chat.id,
+            runway_image_bytes_to_video(src, prompt_text=prompt, filename="input.jpg"),
+        )
+        path = _save_bytes_to_tmp(f"runway_img2vid_{int(time.time())}.mp4", video_bytes)
+        await message.answer_video(FSInputFile(path), caption="Видео готово ✅")
+    except Exception as e:
+        logging.exception("Runway img2vid failed")
+        await message.answer(f"Ошибка генерации видео: {e}")
+
+
+@dp.message(Command("txt2vid"))
+async def cmd_txt2vid(message: Message):
+    """
+    /txt2vid <описание> — сделать видео только из текста.
+    """
+    await _react_ok(message)
+    prompt = (message.text or "").replace("/txt2vid", "", 1).strip()
+    if not prompt:
+        await message.answer("Напиши так: /txt2vid описание сцены/действия.")
+        return
+
+    try:
+        await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
+        task_id, video_bytes = await run_with_thinking(
+            message.bot,
+            message.chat.id,
+            runway_text_to_video(prompt_text=prompt),
+        )
+        path = _save_bytes_to_tmp(f"runway_txt2vid_{int(time.time())}.mp4", video_bytes)
+        await message.answer_video(FSInputFile(path), caption="Видео готово ✅")
+    except Exception as e:
+        logging.exception("Runway txt2vid failed")
+        await message.answer(f"Ошибка генерации видео: {e}")
+
+
 
 
 @dp.message(Command("wb_retouch"))
@@ -585,6 +849,23 @@ async def cb_wb_retouch_last(callback: CallbackQuery):
         logging.exception("Callback WB retouch failed")
         await callback.message.answer(f"Ошибка ретуши: {e}")
 
+
+
+@dp.callback_query(F.data == VIDEO_CB)
+async def cb_video_last(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in last_images:
+        await callback.message.answer("Не нашёл последнее фото. Пришли фото ещё раз.")
+        await callback.answer()
+        return
+
+    pending_video_prompt[user_id] = True
+    await callback.answer("Ок 👍")
+    await callback.message.answer(
+        "🎥 Принял! Теперь пришли ОДНИМ сообщением текст-описание для видео (движение/камера/стиль).\n"
+        "Например: «Плавный наезд камеры, лёгкое вращение товара, студийный свет».\n\n"
+        "Либо используй команду: /img2vid <текст>"
+    )
 
 
 # ---------- reactions ----------
@@ -938,6 +1219,28 @@ async def chat_gpt(message: Message):
     user_text = (message.text or "").strip()
     if not user_text:
         return
+    user_id = message.from_user.id
+
+    # Если мы ждали промпт для видео (после кнопки 🎥)
+    if pending_video_prompt.pop(user_id, False) and not user_text.startswith("/"):
+        src = last_images.get(user_id)
+        if not src:
+            await message.answer("Не вижу последнее фото. Пришли фото ещё раз.")
+            return
+        try:
+            await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
+            task_id, video_bytes = await run_with_thinking(
+                message.bot,
+                message.chat.id,
+                runway_image_bytes_to_video(src, prompt_text=user_text, filename="input.jpg"),
+            )
+            path = _save_bytes_to_tmp(f"runway_video_{int(time.time())}.mp4", video_bytes)
+            await message.answer_video(FSInputFile(path), caption="Видео готово ✅")
+        except Exception as e:
+            logging.exception("Runway img2vid failed (pending mode)")
+            await message.answer(f"Ошибка генерации видео: {e}")
+        return
+
 
     # Команды не трогаем
     if user_text.startswith("/"):
