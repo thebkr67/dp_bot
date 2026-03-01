@@ -38,19 +38,14 @@ DEEPAI_TIMEOUT_SEC = int(os.getenv("DEEPAI_TIMEOUT_SEC", "120"))
 IMG_FALLBACK = os.getenv("IMG_FALLBACK", "openai").lower()  # openai/none
 ENHANCE_DEFAULT_SCALE = int(os.getenv("ENHANCE_DEFAULT_SCALE", "2"))  # 2 or 4
 
-# --- RunwayML (image/text -> video) ---
-# Runway uses Authorization: Bearer <key> and requires X-Runway-Version: 2024-11-06 for v1 endpoints.
-RUNWAYML_API_SECRET = os.getenv("RUNWAYML_API_SECRET") or os.getenv("RUNWAY_API_KEY")
-RUNWAYML_API_BASE = os.getenv("RUNWAYML_API_BASE", "https://api.dev.runwayml.com")
-RUNWAYML_VERSION = os.getenv("RUNWAYML_VERSION", "2024-11-06")
-
-# Defaults (override via env if you want)
-RUNWAY_IMAGE2VIDEO_MODEL = os.getenv("RUNWAY_IMAGE2VIDEO_MODEL", "gen3a_turbo")
-RUNWAY_TEXT2VIDEO_MODEL = os.getenv("RUNWAY_TEXT2VIDEO_MODEL", "gen4.5")
-RUNWAY_DEFAULT_RATIO = os.getenv("RUNWAY_DEFAULT_RATIO", "1280:720")
-RUNWAY_DEFAULT_DURATION = int(os.getenv("RUNWAY_DEFAULT_DURATION", "6"))  # 2..10
-RUNWAY_POLL_INTERVAL_SEC = int(os.getenv("RUNWAY_POLL_INTERVAL_SEC", "5"))  # docs: don't poll > 1/5s
-RUNWAY_TASK_TIMEOUT_SEC = int(os.getenv("RUNWAY_TASK_TIMEOUT_SEC", "600"))
+# --- Pika Labs (image -> video) via fal.ai ---
+FAL_KEY = os.getenv("FAL_KEY") or os.getenv("FAL_API_KEY")
+FAL_QUEUE_BASE = os.getenv("FAL_QUEUE_BASE", "https://queue.fal.run")
+PIKA_IMAGE2VIDEO_MODEL = os.getenv("PIKA_IMAGE2VIDEO_MODEL", "fal-ai/pika/v2.2/image-to-video")
+PIKA_DEFAULT_RESOLUTION = os.getenv("PIKA_DEFAULT_RESOLUTION", "720p")  # 720p or 1080p
+PIKA_DEFAULT_DURATION = int(os.getenv("PIKA_DEFAULT_DURATION", "5"))  # 5 or 10
+PIKA_POLL_INTERVAL_SEC = int(os.getenv("PIKA_POLL_INTERVAL_SEC", "5"))
+PIKA_TASK_TIMEOUT_SEC = int(os.getenv("PIKA_TASK_TIMEOUT_SEC", "600"))
 
 if not DEEPAI_API_KEY:
     logging.warning("DEEPAI_API_KEY is not set (DeepAI features disabled)")
@@ -519,193 +514,113 @@ async def enhance_image(image_bytes: bytes) -> bytes:
         return img.content
 
 
-# ---------------- RunwayML: image/text -> video ----------------
+
+# ---------------- Pika (fal.ai) image -> video ----------------
 # Docs:
-# - POST /v1/image_to_video, POST /v1/text_to_video, GET /v1/tasks/{id}, POST /v1/uploads
-# - X-Runway-Version must be "2024-11-06"
-# - SUCCEEDED task returns "output": [<url>, ...]
-# See official docs: https://docs.dev.runwayml.com/ (API Reference + Output formats)
+# - Model: fal-ai/pika/v2.2/image-to-video
+# - Submit: POST https://queue.fal.run/<model_id> with JSON body matching schema
+# - Status: GET  https://queue.fal.run/<model_id>/requests/<request_id>/status
+# - Result: GET  https://queue.fal.run/<model_id>/requests/<request_id>
+# Auth: Authorization: Key <FAL_KEY>
+# Files: you can pass image_url as hosted URL or as base64 data URI.
+# Sources:
+# - Pika v2.2 schema + inputs/outputs: https://fal.ai/models/fal-ai/pika/v2.2/image-to-video/api
+# - Queue API: https://docs.fal.ai/model-apis/model-endpoints/queue
 
-def _runway_headers() -> dict:
-    if not RUNWAYML_API_SECRET:
-        raise RuntimeError("RUNWAYML_API_SECRET is not set")
+def _fal_headers() -> dict:
+    if not FAL_KEY:
+        raise RuntimeError("FAL_KEY is not set")
     return {
-        "Authorization": f"Bearer {RUNWAYML_API_SECRET}",
-        "X-Runway-Version": RUNWAYML_VERSION,
+        "Authorization": f"Key {FAL_KEY}",
+        "Content-Type": "application/json",
     }
 
 
-async def runway_create_ephemeral_upload(file_bytes: bytes, filename: str) -> str:
-    """
-    Upload bytes as an ephemeral asset and return runway:// URI.
-    This uses POST /v1/uploads to get a presigned uploadUrl + fields, then uploads the file with multipart/form-data.
-    """
-    if not file_bytes:
-        raise ValueError("Empty file_bytes")
-
-    meta_url = f"{RUNWAYML_API_BASE}/v1/uploads"
-    headers = {**_runway_headers(), "Content-Type": "application/json"}
-    payload = {"filename": filename, "type": "ephemeral"}
-
+async def fal_queue_submit(model_id: str, payload: dict) -> dict:
+    url = f"{FAL_QUEUE_BASE}/{model_id}"
+    headers = _fal_headers()
     async with httpx.AsyncClient(timeout=60) as client_http:
-        r = await client_http.post(meta_url, headers=headers, json=payload)
+        r = await client_http.post(url, headers=headers, json=payload)
         r.raise_for_status()
-        meta = r.json()
+        return r.json()
 
-    upload_url = meta.get("uploadUrl")
-    fields = meta.get("fields") or {}
-    runway_uri = meta.get("runwayUri")
 
-    if not upload_url or not runway_uri:
-        raise RuntimeError(f"Runway upload init failed: {meta}")
+async def fal_queue_status(model_id: str, request_id: str, *, logs: bool = False) -> dict:
+    q = "?logs=1" if logs else ""
+    url = f"{FAL_QUEUE_BASE}/{model_id}/requests/{request_id}/status{q}"
+    headers = _fal_headers()
+    async with httpx.AsyncClient(timeout=60) as client_http:
+        r = await client_http.get(url, headers=headers)
+        r.raise_for_status()
+        return r.json()
 
-    # Now do the actual upload to the presigned URL
-    # Important: for S3-style presigned POST, fields MUST be included exactly as provided.
-    form = dict(fields)
-    files = {
-        "file": (filename, file_bytes, "application/octet-stream")
-    }
 
+async def fal_queue_result(model_id: str, request_id: str) -> dict:
+    url = f"{FAL_QUEUE_BASE}/{model_id}/requests/{request_id}"
+    headers = _fal_headers()
     async with httpx.AsyncClient(timeout=120) as client_http:
-        rr = await client_http.post(upload_url, data=form, files=files)
-        rr.raise_for_status()
-
-    return runway_uri
-
-
-async def runway_submit_image_to_video(
-    prompt_text: str,
-    prompt_image_uri: str,
-    *,
-    model: str = RUNWAY_IMAGE2VIDEO_MODEL,
-    ratio: str = RUNWAY_DEFAULT_RATIO,
-    duration: int = RUNWAY_DEFAULT_DURATION,
-) -> str:
-    url = f"{RUNWAYML_API_BASE}/v1/image_to_video"
-    headers = {**_runway_headers(), "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "promptText": prompt_text,
-        "promptImage": prompt_image_uri,
-        "ratio": ratio,
-        "duration": int(duration),
-    }
-
-    async with httpx.AsyncClient(timeout=60) as client_http:
-        r = await client_http.post(url, headers=headers, json=payload)
+        r = await client_http.get(url, headers=headers)
         r.raise_for_status()
-        data = r.json()
-
-    task_id = data.get("id")
-    if not task_id:
-        raise RuntimeError(f"Runway image_to_video failed: {data}")
-    return task_id
+        return r.json()
 
 
-async def runway_submit_text_to_video(
-    prompt_text: str,
-    *,
-    model: str = RUNWAY_TEXT2VIDEO_MODEL,
-    ratio: str = RUNWAY_DEFAULT_RATIO,
-    duration: int = RUNWAY_DEFAULT_DURATION,
-) -> str:
-    url = f"{RUNWAYML_API_BASE}/v1/text_to_video"
-    headers = {**_runway_headers(), "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "promptText": prompt_text,
-        "ratio": ratio,
-        "duration": int(duration),
-    }
-
-    async with httpx.AsyncClient(timeout=60) as client_http:
-        r = await client_http.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
-
-    task_id = data.get("id")
-    if not task_id:
-        raise RuntimeError(f"Runway text_to_video failed: {data}")
-    return task_id
-
-
-async def runway_wait_task_output(task_id: str, *, timeout_sec: int = RUNWAY_TASK_TIMEOUT_SEC) -> list[str]:
-    url = f"{RUNWAYML_API_BASE}/v1/tasks/{task_id}"
-    headers = _runway_headers()
-
+async def fal_wait_for_result(model_id: str, request_id: str, *, timeout_sec: int = PIKA_TASK_TIMEOUT_SEC) -> dict:
     start = time.time()
     last_status = None
+    while True:
+        status_obj = await fal_queue_status(model_id, request_id, logs=False)
+        status = status_obj.get("status")
+        if status and status != last_status:
+            last_status = status
 
-    async with httpx.AsyncClient(timeout=60) as client_http:
-        while True:
-            r = await client_http.get(url, headers=headers)
-            if r.status_code == 404:
-                raise RuntimeError("Runway task not found (deleted/canceled?)")
-            r.raise_for_status()
-            data = r.json()
+        if status == "COMPLETED":
+            return await fal_queue_result(model_id, request_id)
 
-            status = data.get("status")
-            if status and status != last_status:
-                last_status = status
+        # IN_QUEUE / IN_PROGRESS return 202 from status endpoint; json still has status field.
+        if time.time() - start > timeout_sec:
+            raise TimeoutError(f"fal.ai task timeout after {timeout_sec}s (last status: {status})")
 
-            if status == "SUCCEEDED":
-                output = data.get("output") or []
-                if not isinstance(output, list) or not output:
-                    raise RuntimeError(f"Runway task succeeded but has no output: {data}")
-                return output
-            if status in ("FAILED", "CANCELED", "CANCELLED", "ABORTED", "DELETED"):
-                raise RuntimeError(f"Runway task {status}: {data}")
-
-            if time.time() - start > timeout_sec:
-                raise TimeoutError(f"Runway task timeout after {timeout_sec}s (last status: {status})")
-
-            await asyncio.sleep(max(1, RUNWAY_POLL_INTERVAL_SEC))
+        await asyncio.sleep(max(1, PIKA_POLL_INTERVAL_SEC))
 
 
-async def runway_download_bytes(url: str) -> bytes:
-    async with httpx.AsyncClient(timeout=180) as client_http:
-        r = await client_http.get(url)
-        r.raise_for_status()
-        return r.content
-
-
-async def runway_image_bytes_to_video(
+async def pika_image_bytes_to_video(
     image_bytes: bytes,
     *,
-    prompt_text: str,
-    filename: str = "input.jpg",
-    model: str = RUNWAY_IMAGE2VIDEO_MODEL,
-    ratio: str = RUNWAY_DEFAULT_RATIO,
-    duration: int = RUNWAY_DEFAULT_DURATION,
+    prompt: str,
+    resolution: str = PIKA_DEFAULT_RESOLUTION,
+    duration: int = PIKA_DEFAULT_DURATION,
+    negative_prompt: str = "",
+    seed: int | None = None,
 ) -> tuple[str, bytes]:
-    """Return (task_id, mp4_bytes)."""
-    data_uri = _to_data_uri(image_bytes)
-    task_id = await runway_submit_image_to_video(
-        prompt_text,
-        data_uri,
-        model=model,
-        ratio=ratio,
-        duration=duration,
-    )
-    outputs = await runway_wait_task_output(task_id)
-    video_url = outputs[0]
-    video_bytes = await runway_download_bytes(video_url)
-    return task_id, video_bytes
+    """Return (request_id, mp4_bytes) using fal-ai/pika/v2.2/image-to-video."""
+    if not image_bytes:
+        raise ValueError("No image bytes")
+    payload = {
+        "image_url": _to_data_uri(image_bytes),
+        "prompt": prompt,
+        "resolution": resolution,
+        "duration": int(duration),
+    }
+    if negative_prompt:
+        payload["negative_prompt"] = negative_prompt
+    if seed is not None:
+        payload["seed"] = int(seed)
 
+    submit = await fal_queue_submit(PIKA_IMAGE2VIDEO_MODEL, payload)
+    request_id = submit.get("request_id")
+    if not request_id:
+        raise RuntimeError(f"fal.ai submit failed: {submit}")
 
-async def runway_text_to_video(
-    *,
-    prompt_text: str,
-    model: str = RUNWAY_TEXT2VIDEO_MODEL,
-    ratio: str = RUNWAY_DEFAULT_RATIO,
-    duration: int = RUNWAY_DEFAULT_DURATION,
-) -> tuple[str, bytes]:
-    """Return (task_id, mp4_bytes)."""
-    task_id = await runway_submit_text_to_video(prompt_text, model=model, ratio=ratio, duration=duration)
-    outputs = await runway_wait_task_output(task_id)
-    video_url = outputs[0]
-    video_bytes = await runway_download_bytes(video_url)
-    return task_id, video_bytes
+    result = await fal_wait_for_result(PIKA_IMAGE2VIDEO_MODEL, request_id)
+    # Result shape typically: {"video": {"url": "...mp4"}}
+    video_url = ((result or {}).get("video") or {}).get("url")
+    if not video_url:
+        raise RuntimeError(f"fal.ai result missing video url: {result}")
+
+    async with httpx.AsyncClient(timeout=180) as client_http:
+        r = await client_http.get(video_url)
+        r.raise_for_status()
+        return request_id, r.content
 
 
 @dp.message(Command("img"))
@@ -768,9 +683,9 @@ async def cmd_img2vid(message: Message):
         task_id, video_bytes = await run_with_thinking(
             message.bot,
             message.chat.id,
-            runway_image_bytes_to_video(src, prompt_text=prompt, filename="input.jpg"),
+            pika_image_bytes_to_video(src, prompt=prompt),
         )
-        path = _save_bytes_to_tmp(f"runway_img2vid_{int(time.time())}.mp4", video_bytes)
+        path = _save_bytes_to_tmp(f"pika_img2vid_{int(time.time())}.mp4", video_bytes)
         await message.answer_video(FSInputFile(path), caption="Видео готово ✅")
     except Exception as e:
         logging.exception("Runway img2vid failed")
@@ -779,27 +694,8 @@ async def cmd_img2vid(message: Message):
 
 @dp.message(Command("txt2vid"))
 async def cmd_txt2vid(message: Message):
-    """
-    /txt2vid <описание> — сделать видео только из текста.
-    """
     await _react_ok(message)
-    prompt = (message.text or "").replace("/txt2vid", "", 1).strip()
-    if not prompt:
-        await message.answer("Напиши так: /txt2vid описание сцены/действия.")
-        return
-
-    try:
-        await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
-        task_id, video_bytes = await run_with_thinking(
-            message.bot,
-            message.chat.id,
-            runway_text_to_video(prompt_text=prompt),
-        )
-        path = _save_bytes_to_tmp(f"runway_txt2vid_{int(time.time())}.mp4", video_bytes)
-        await message.answer_video(FSInputFile(path), caption="Видео готово ✅")
-    except Exception as e:
-        logging.exception("Runway txt2vid failed")
-        await message.answer(f"Ошибка генерации видео: {e}")
+    await message.answer("txt2vid сейчас не подключен. Подключен только img2vid через Pika (fal.ai).")
 
 
 
@@ -814,7 +710,7 @@ async def cmd_wb_retouch(message: Message):
         return
 
     try:
-        img_bytes = await run_with_thinking(message.bot, message.chat.id, retouch_for_wb(src))
+        img_bytes = await run_with_thinking(callback.bot, callback.message.chat.id, retouch_for_wb(src))
         path = _save_bytes_to_tmp(f"wb_retouch_{int(time.time())}.png", img_bytes)
         await message.answer_document(FSInputFile(path), caption="WB ретушь готова ✅")
     except Exception as e:
@@ -850,7 +746,7 @@ async def cb_wb_retouch_last(callback: CallbackQuery):
         return
     await callback.answer("Ретуширую…")
     try:
-        img_bytes = await run_with_thinking(message.bot, message.chat.id, retouch_for_wb(src))
+        img_bytes = await run_with_thinking(callback.bot, callback.message.chat.id, retouch_for_wb(src))
         path = _save_bytes_to_tmp(f"wb_retouch_{int(time.time())}.png", img_bytes)
         await callback.message.answer_document(FSInputFile(path), caption="WB ретушь готова ✅")
     except Exception as e:
@@ -1240,9 +1136,9 @@ async def chat_gpt(message: Message):
             task_id, video_bytes = await run_with_thinking(
                 message.bot,
                 message.chat.id,
-                runway_image_bytes_to_video(src, prompt_text=user_text, filename="input.jpg"),
+                pika_image_bytes_to_video(src, prompt=user_text),
             )
-            path = _save_bytes_to_tmp(f"runway_video_{int(time.time())}.mp4", video_bytes)
+            path = _save_bytes_to_tmp(f"pika_video_{int(time.time())}.mp4", video_bytes)
             await message.answer_video(FSInputFile(path), caption="Видео готово ✅")
         except Exception as e:
             logging.exception("Runway img2vid failed (pending mode)")
