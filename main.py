@@ -279,6 +279,14 @@ def _detect_image_mime_from_bytes(data: bytes) -> str:
     return "image/png"
 
 
+def _to_data_uri(image_bytes: bytes) -> str:
+    """Encode image bytes to a data URI for Runway API input."""
+    mime = _detect_image_mime_from_bytes(image_bytes)
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
+
 async def _download_telegram_file(bot: Bot, file_id: str) -> Tuple[bytes, str]:
     file = await bot.get_file(file_id)
     buf = io.BytesIO()
@@ -671,10 +679,10 @@ async def runway_image_bytes_to_video(
     duration: int = RUNWAY_DEFAULT_DURATION,
 ) -> tuple[str, bytes]:
     """Return (task_id, mp4_bytes)."""
-    runway_uri = await runway_create_ephemeral_upload(image_bytes, filename)
+    data_uri = _to_data_uri(image_bytes)
     task_id = await runway_submit_image_to_video(
         prompt_text,
-        runway_uri,
+        data_uri,
         model=model,
         ratio=ratio,
         duration=duration,
