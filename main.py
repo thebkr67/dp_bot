@@ -841,7 +841,7 @@ async def run_with_thinking(bot: Bot, chat_id: int, coro):
 @dp.message(Command("start"))
 async def welcome(message: Message):
     await message.answer(
-        "Привет, я Альтератти, бот, созданный thebkr.\n"
+        "Привет, я Альтераччи, бот, созданный thebkr.\n"
     )
 
 
