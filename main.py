@@ -13,8 +13,9 @@ from typing import Optional, Tuple
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, FSInputFile
+from aiogram.types import Message, FSInputFile, CallbackQuery
 from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from openai import OpenAI
 
@@ -33,6 +34,8 @@ SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 
 DEEPAI_API_KEY = os.getenv("DEEPAI_API_KEY")
 DEEPAI_TIMEOUT_SEC = int(os.getenv("DEEPAI_TIMEOUT_SEC", "120"))
+IMG_FALLBACK = os.getenv("IMG_FALLBACK", "openai").lower()  # openai/none
+ENHANCE_DEFAULT_SCALE = int(os.getenv("ENHANCE_DEFAULT_SCALE", "2"))  # 2 or 4
 
 if not DEEPAI_API_KEY:
     raise RuntimeError("DEEPAI_API_KEY is not set")
@@ -93,6 +96,8 @@ class LastFile:
 last_files: dict[int, LastFile] = {}  # key = telegram user_id
 
 # ---------- last image storage ----------
+ENHANCE_CB = "enhance:last"
+RETROUCH_CB = "retouch:last"
 last_images: dict[int, bytes] = {}  # key = telegram user_id
 
 
@@ -363,6 +368,82 @@ async def _edit_xlsx_bytes(data: bytes, instructions: str) -> Tuple[bytes, str]:
 
 # ---------- DeepAI image generation / enhance ----------
 
+
+def _image_action_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✨ Улучшить", callback_data=ENHANCE_CB)
+    kb.button(text="🛍️ WB ретушь", callback_data=RETROUCH_CB)
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+async def _openai_image_generate(prompt: str) -> bytes:
+    res = client.images.generate(
+        model="gpt-image-1",
+        prompt=prompt,
+    )
+    b64 = res.data[0].b64_json
+    return base64.b64decode(b64)
+
+
+async def _openai_image_edit(image_bytes: bytes, prompt: str) -> bytes:
+    mime = _detect_image_mime_from_bytes(image_bytes)
+    img_file = io.BytesIO(image_bytes)
+    img_file.name = "input.png" if mime == "image/png" else "input.jpg"
+    res = client.images.edits(
+        model="gpt-image-1",
+        image=img_file,
+        prompt=prompt,
+    )
+    b64 = res.data[0].b64_json
+    return base64.b64decode(b64)
+
+
+async def generate_image_from_text_with_fallback(prompt: str) -> bytes:
+    try:
+        return await generate_image_from_text(prompt)
+    except Exception:
+        if IMG_FALLBACK == "openai":
+            logging.exception("DeepAI text2img failed, using OpenAI fallback")
+            return await _openai_image_generate(prompt)
+        raise
+
+
+async def enhance_image_with_fallback(image_bytes: bytes, scale: int = 2) -> bytes:
+    """scale: 2 or 4. DeepAI torch-srgan is ~2x; for 4x run twice."""
+    scale = 4 if int(scale) == 4 else 2
+    try:
+        out = await enhance_image(image_bytes)
+        if scale == 4:
+            out = await enhance_image(out)
+        return out
+    except Exception:
+        if IMG_FALLBACK == "openai":
+            logging.exception("DeepAI enhance failed, using OpenAI fallback")
+            prompt = "Улучши качество фото: резкость, детализация, шумоподавление, натуральные цвета. Без изменения смысла."
+            out = await _openai_image_edit(image_bytes, prompt)
+            if scale == 4:
+                out = await _openai_image_edit(out, prompt)
+            return out
+        raise
+
+
+async def retouch_for_wb(image_bytes: bytes) -> bytes:
+    """AI ретушь для карточек WB: чище, контрастнее, без изменения товара."""
+    prompt = (
+        "Сделай ретушь фото товара для маркетплейса Wildberries: "
+        "увеличь четкость и детализацию, убери шум и грязные оттенки, "
+        "сделай фон максимально чистым и аккуратным (без лишних объектов), "
+        "сохрани натуральные цвета и фактуру товара, "
+        "не меняй форму и дизайн товара. "
+        "Результат должен выглядеть как качественная студийная предметная съемка."
+    )
+    if IMG_FALLBACK == "openai":
+        return await _openai_image_edit(image_bytes, prompt)
+    # Best-effort: у DeepAI нет промпта в SRGAN, поэтому просто улучшение.
+    return await enhance_image(image_bytes)
+
+
 DEEPAI_TEXT2IMG_URL = "https://api.deepai.org/api/text2img"
 DEEPAI_UPSCALE_URL = "https://api.deepai.org/api/torch-srgan"
 
@@ -420,7 +501,7 @@ async def cmd_img(message: Message):
         return
 
     try:
-        img_bytes = await generate_image_from_text(prompt)
+        img_bytes = await generate_image_from_text_with_fallback(prompt)
         path = _save_bytes_to_tmp(f"img_{int(time.time())}.png", img_bytes)
         await message.answer_document(FSInputFile(path), caption="Готово ✅")
     except Exception as e:
@@ -433,17 +514,75 @@ async def cmd_enhance(message: Message):
     user_id = message.from_user.id
     src = last_images.get(user_id)
 
+    # scale: /enhance 2, /enhance 4, /enhance 2x, /enhance 4x
+    m = re.search(r"\b(2|4)\s*x?\b", (message.text or ""))
+    scale = int(m.group(1)) if m else ENHANCE_DEFAULT_SCALE
+
     if not src:
         await message.answer("Сначала пришли фото, которое нужно улучшить.")
         return
 
     try:
-        img_bytes = await enhance_image(src)
+        img_bytes = await enhance_image_with_fallback(src, scale=scale)
         path = _save_bytes_to_tmp(f"enhanced_{int(time.time())}.png", img_bytes)
         await message.answer_document(FSInputFile(path), caption="Улучшил ✅")
     except Exception as e:
         logging.exception("DeepAI enhance failed")
         await message.answer(f"Ошибка улучшения: {e}")
+
+
+@dp.message(Command("wb_retouch"))
+async def cmd_wb_retouch(message: Message):
+    user_id = message.from_user.id
+    src = last_images.get(user_id)
+
+    if not src:
+        await message.answer("Сначала пришли фото, которое нужно отретушировать под WB.")
+        return
+
+    try:
+        img_bytes = await retouch_for_wb(src)
+        path = _save_bytes_to_tmp(f"wb_retouch_{int(time.time())}.png", img_bytes)
+        await message.answer_document(FSInputFile(path), caption="WB ретушь готова ✅")
+    except Exception as e:
+        logging.exception("WB retouch failed")
+        await message.answer(f"Ошибка ретуши: {e}")
+
+
+@dp.callback_query(F.data == ENHANCE_CB)
+async def cb_enhance_last(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    src = last_images.get(user_id)
+    if not src:
+        await callback.message.answer("Не нашёл последнее фото. Пришли фото ещё раз.")
+        await callback.answer()
+        return
+    await callback.answer("Улучшаю…")
+    try:
+        img_bytes = await enhance_image_with_fallback(src, scale=ENHANCE_DEFAULT_SCALE)
+        path = _save_bytes_to_tmp(f"enhanced_{int(time.time())}.png", img_bytes)
+        await callback.message.answer_document(FSInputFile(path), caption="Улучшил ✅")
+    except Exception as e:
+        logging.exception("Callback enhance failed")
+        await callback.message.answer(f"Ошибка улучшения: {e}")
+
+
+@dp.callback_query(F.data == RETROUCH_CB)
+async def cb_wb_retouch_last(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    src = last_images.get(user_id)
+    if not src:
+        await callback.message.answer("Не нашёл последнее фото. Пришли фото ещё раз.")
+        await callback.answer()
+        return
+    await callback.answer("Ретуширую…")
+    try:
+        img_bytes = await retouch_for_wb(src)
+        path = _save_bytes_to_tmp(f"wb_retouch_{int(time.time())}.png", img_bytes)
+        await callback.message.answer_document(FSInputFile(path), caption="WB ретушь готова ✅")
+    except Exception as e:
+        logging.exception("Callback WB retouch failed")
+        await callback.message.answer(f"Ошибка ретуши: {e}")
 
 # ---------- commands ----------
 @dp.message(Command("start"))
@@ -656,6 +795,8 @@ async def handle_photo(message: Message, bot: Bot):
     photo = message.photo[-1]
     image_bytes, _ = await _download_telegram_file(bot, photo.file_id)
 
+    last_images[message.from_user.id] = image_bytes
+
     prompt = (
         "Распознай, что на изображении, и помоги пользователю.\n"
         "Если это документ/скрин — извлеки ключевой текст, найди ошибки/суть и дай рекомендации.\n"
@@ -669,6 +810,7 @@ async def handle_photo(message: Message, bot: Bot):
 
     reference.response = answer
     await message.answer(answer)
+    await message.answer("Что сделать с фото?", reply_markup=_image_action_keyboard())
 
 
 @dp.message(F.document)
@@ -699,6 +841,7 @@ async def handle_document(message: Message, bot: Bot):
         return
 
     if ext in {".png", ".jpg", ".jpeg", ".webp"} or mime.startswith("image/"):
+        last_images[message.from_user.id] = file_bytes
         prompt = f"Пользователь прислал изображение файлом: {filename}. Распознай и помоги."
         try:
             answer = await _ask_openai_vision(prompt, file_bytes)
@@ -708,6 +851,7 @@ async def handle_document(message: Message, bot: Bot):
             return
         reference.response = answer
         await message.answer(answer)
+        await message.answer("Что сделать с изображением?", reply_markup=_image_action_keyboard())
         await message.answer("Файл запомнил. Если нужно изменить — напиши /edit <что поменять>.")
         return
 
