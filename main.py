@@ -112,6 +112,24 @@ VIDEO_CB = "video:last"
 last_images: dict[int, bytes] = {}  # key = telegram user_id
 pending_video_prompt: dict[int, bool] = {}  # user_id -> ждём текст-подсказку для видео
 
+# Keep timestamp of last received image per user (for "question after image" flow)
+IMAGE_CONTEXT_TTL_SEC = int(os.getenv("IMAGE_CONTEXT_TTL_SEC", "180"))  # seconds
+last_image_ts: dict[int, float] = {}  # user_id -> unix ts
+
+
+def should_use_last_image(text: str) -> bool:
+    """Heuristic: treat message as a question to the last image."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if "?" in t:
+        return True
+    if any(k in t for k in ["на фото", "на картинке", "на изображении", "на скрине", "на скриншоте", "вот это", "что тут", "что здесь"]):
+        return True
+    if re.search(r"\b(что|кто|где|когда|почему|зачем|как|какой|какая|какие|сколько|это)\b", t):
+        return True
+    return False
+
 
 # ---------- autosearch state ----------
 _last_search_at: dict[int, float] = {}
@@ -742,7 +760,7 @@ async def cmd_wb_retouch(message: Message):
         return
 
     try:
-        img_bytes = await run_with_thinking(callback.bot, callback.message.chat.id, retouch_for_wb(src))
+        img_bytes = await run_with_thinking(message.bot, message.chat.id, retouch_for_wb(src))
         path = _save_bytes_to_tmp(f"wb_retouch_{int(time.time())}.png", img_bytes)
         await message.answer_document(FSInputFile(path), caption="WB ретушь готова ✅")
     except Exception as e:
@@ -778,7 +796,7 @@ async def cb_wb_retouch_last(callback: CallbackQuery):
         return
     await callback.answer("Ретуширую…")
     try:
-        img_bytes = await run_with_thinking(callback.bot, callback.message.chat.id, retouch_for_wb(src))
+        img_bytes = await run_with_thinking(message.bot, message.chat.id, retouch_for_wb(src))
         path = _save_bytes_to_tmp(f"wb_retouch_{int(time.time())}.png", img_bytes)
         await callback.message.answer_document(FSInputFile(path), caption="WB ретушь готова ✅")
     except Exception as e:
@@ -1050,11 +1068,20 @@ async def handle_photo(message: Message, bot: Bot):
     image_bytes, _ = await _download_telegram_file(bot, photo.file_id)
 
     last_images[message.from_user.id] = image_bytes
+    last_image_ts[message.from_user.id] = time.time()
 
-    prompt = (
-        "Распознай, что на изображении, и помоги пользователю.\n"
-        "Если это документ/скрин — извлеки ключевой текст, найди ошибки/суть и дай рекомендации.\n"
-    )
+    user_question = (message.caption or "").strip()
+    if user_question:
+        prompt = (
+            "Ты анализируешь изображение и отвечаешь на вопрос пользователя. "
+            "Отвечай по делу, без воды. Если по фото нельзя понять — скажи, что именно не видно.\n\n"
+            f"ВОПРОС ПОЛЬЗОВАТЕЛЯ: {user_question}"
+        )
+    else:
+        prompt = (
+            "Распознай, что на изображении, и помоги пользователю.\n"
+            "Если это документ/скрин — извлеки ключевой текст, найди ошибки/суть и дай рекомендации.\n"
+        )
     try:
         answer = await run_with_thinking(message.bot, message.chat.id, _ask_openai_vision(prompt, image_bytes))
     except Exception as e:
@@ -1097,7 +1124,16 @@ async def handle_document(message: Message, bot: Bot):
 
     if ext in {".png", ".jpg", ".jpeg", ".webp"} or mime.startswith("image/"):
         last_images[message.from_user.id] = file_bytes
-        prompt = f"Пользователь прислал изображение файлом: {filename}. Распознай и помоги."
+        last_image_ts[message.from_user.id] = time.time()
+        user_question = (message.caption or "").strip()
+        if user_question:
+            prompt = (
+                "Ты анализируешь изображение и отвечаешь на вопрос пользователя. "
+                "Отвечай по делу, без воды. Если по фото нельзя понять — скажи, что именно не видно.\n\n"
+                f"ВОПРОС ПОЛЬЗОВАТЕЛЯ: {user_question}"
+            )
+        else:
+            prompt = f"Пользователь прислал изображение файлом: {filename}. Распознай и помоги."
         try:
             answer = await run_with_thinking(message.bot, message.chat.id, _ask_openai_vision(prompt, file_bytes))
         except Exception as e:
@@ -1180,6 +1216,26 @@ async def chat_gpt(message: Message):
 
     # Команды не трогаем
     if user_text.startswith("/"):
+        return
+
+    # --- QUESTION TO LAST IMAGE (photo + text) ---
+    src_img = last_images.get(user_id)
+    ts_img = last_image_ts.get(user_id, 0.0)
+    if src_img and (time.time() - ts_img) <= IMAGE_CONTEXT_TTL_SEC and should_use_last_image(user_text):
+        prompt = (
+            "Пользователь задаёт вопрос к ПОСЛЕДНЕМУ присланному изображению. "
+            "Ответь максимально конкретно. Если нужно — перечисли, что именно на изображении. "
+            "Если информации не хватает — скажи, какой ракурс/фрагмент нужен.\n\n"
+            f"ВОПРОС ПОЛЬЗОВАТЕЛЯ: {user_text}"
+        )
+        try:
+            answer = await run_with_thinking(message.bot, message.chat.id, _ask_openai_vision(prompt, src_img))
+        except Exception as e:
+            logging.exception("OpenAI vision failed (last image Q)")
+            await message.answer(f"OpenAI error: {e}")
+            return
+        reference.response = answer
+        await message.answer(answer)
         return
 
     # --- AUT0SEARCH ---
