@@ -583,6 +583,36 @@ async def fal_wait_for_result(model_id: str, request_id: str, *, timeout_sec: in
         await asyncio.sleep(max(1, PIKA_POLL_INTERVAL_SEC))
 
 
+async def fal_wait_for_result_by_urls(status_url: str, response_url: str, *, timeout_sec: int = PIKA_TASK_TIMEOUT_SEC) -> dict:
+    """Wait for completion using the status_url/response_url returned by fal submit.
+    This avoids the 'subpath' pitfall where status/result endpoints omit the subpath."""
+    start = time.time()
+    last_status = None
+    headers = _fal_headers()
+
+    async with httpx.AsyncClient(timeout=60) as client_http:
+        while True:
+            r = await client_http.get(status_url, headers=headers)
+            # status endpoint returns 202 for IN_QUEUE/IN_PROGRESS, 200 for COMPLETED
+            if r.status_code not in (200, 202):
+                r.raise_for_status()
+            status_obj = r.json()
+            status = status_obj.get("status")
+            if status and status != last_status:
+                last_status = status
+
+            if status == "COMPLETED":
+                rr = await client_http.get(response_url, headers=headers)
+                rr.raise_for_status()
+                return rr.json()
+
+            if time.time() - start > timeout_sec:
+                raise TimeoutError(f"fal.ai task timeout after {timeout_sec}s (last status: {status})")
+
+            await asyncio.sleep(max(1, PIKA_POLL_INTERVAL_SEC))
+
+
+
 async def pika_image_bytes_to_video(
     image_bytes: bytes,
     *,
@@ -608,10 +638,12 @@ async def pika_image_bytes_to_video(
 
     submit = await fal_queue_submit(PIKA_IMAGE2VIDEO_MODEL, payload)
     request_id = submit.get("request_id")
-    if not request_id:
+    status_url = submit.get("status_url")
+    response_url = submit.get("response_url")
+    if not request_id or not status_url or not response_url:
         raise RuntimeError(f"fal.ai submit failed: {submit}")
 
-    result = await fal_wait_for_result(PIKA_IMAGE2VIDEO_MODEL, request_id)
+    result = await fal_wait_for_result_by_urls(status_url, response_url)
     # Result shape typically: {"video": {"url": "...mp4"}}
     video_url = ((result or {}).get("video") or {}).get("url")
     if not video_url:
