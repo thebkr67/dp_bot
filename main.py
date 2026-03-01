@@ -13,7 +13,7 @@ from typing import Optional, Tuple
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, FSInputFile, CallbackQuery
+from aiogram.types import Message, FSInputFile, CallbackQuery, ReactionTypeEmoji
 from aiogram.enums import ChatAction
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -586,6 +586,18 @@ async def cb_wb_retouch_last(callback: CallbackQuery):
         await callback.message.answer(f"Ошибка ретуши: {e}")
 
 
+
+# ---------- reactions ----------
+async def _react_ok(message: Message):
+    try:
+        await message.bot.set_message_reaction(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            reaction=[ReactionTypeEmoji(emoji="👌")]
+        )
+    except Exception:
+        pass
+
 # ---------- thinking indicator ----------
 async def _thinking_indicator(bot: Bot, chat_id: int, stop_event: asyncio.Event):
     """Показывает 'бот печатает…' пока не установлен stop_event."""
@@ -816,6 +828,7 @@ async def cmd_research(message: Message):
 # ---------- file handlers ----------
 @dp.message(F.photo)
 async def handle_photo(message: Message, bot: Bot):
+    await _react_ok(message)
     photo = message.photo[-1]
     image_bytes, _ = await _download_telegram_file(bot, photo.file_id)
 
@@ -839,6 +852,7 @@ async def handle_photo(message: Message, bot: Bot):
 
 @dp.message(F.document)
 async def handle_document(message: Message, bot: Bot):
+    await _react_ok(message)
     doc = message.document
     filename = doc.file_name or "file"
     ext = _ext(filename)
@@ -920,6 +934,7 @@ async def handle_document(message: Message, bot: Bot):
 
 @dp.message(F.text)
 async def chat_gpt(message: Message):
+    await _react_ok(message)
     user_text = (message.text or "").strip()
     if not user_text:
         return
