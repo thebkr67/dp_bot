@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile, CallbackQuery
+from aiogram.enums import ChatAction
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -390,7 +391,7 @@ async def _openai_image_edit(image_bytes: bytes, prompt: str) -> bytes:
     mime = _detect_image_mime_from_bytes(image_bytes)
     img_file = io.BytesIO(image_bytes)
     img_file.name = "input.png" if mime == "image/png" else "input.jpg"
-    res = client.images.edits(
+    res = client.images.edit(
         model="gpt-image-1",
         image=img_file,
         prompt=prompt,
@@ -501,7 +502,7 @@ async def cmd_img(message: Message):
         return
 
     try:
-        img_bytes = await generate_image_from_text_with_fallback(prompt)
+        img_bytes = await run_with_thinking(bot, message.chat.id, generate_image_from_text_with_fallback(prompt))
         path = _save_bytes_to_tmp(f"img_{int(time.time())}.png", img_bytes)
         await message.answer_document(FSInputFile(path), caption="Готово ✅")
     except Exception as e:
@@ -523,7 +524,7 @@ async def cmd_enhance(message: Message):
         return
 
     try:
-        img_bytes = await enhance_image_with_fallback(src, scale=scale)
+        img_bytes = await run_with_thinking(bot, message.chat.id, enhance_image_with_fallback(src, scale=scale))
         path = _save_bytes_to_tmp(f"enhanced_{int(time.time())}.png", img_bytes)
         await message.answer_document(FSInputFile(path), caption="Улучшил ✅")
     except Exception as e:
@@ -541,7 +542,7 @@ async def cmd_wb_retouch(message: Message):
         return
 
     try:
-        img_bytes = await retouch_for_wb(src)
+        img_bytes = await run_with_thinking(bot, message.chat.id, retouch_for_wb(src))
         path = _save_bytes_to_tmp(f"wb_retouch_{int(time.time())}.png", img_bytes)
         await message.answer_document(FSInputFile(path), caption="WB ретушь готова ✅")
     except Exception as e:
@@ -577,12 +578,35 @@ async def cb_wb_retouch_last(callback: CallbackQuery):
         return
     await callback.answer("Ретуширую…")
     try:
-        img_bytes = await retouch_for_wb(src)
+        img_bytes = await run_with_thinking(bot, message.chat.id, retouch_for_wb(src))
         path = _save_bytes_to_tmp(f"wb_retouch_{int(time.time())}.png", img_bytes)
         await callback.message.answer_document(FSInputFile(path), caption="WB ретушь готова ✅")
     except Exception as e:
         logging.exception("Callback WB retouch failed")
         await callback.message.answer(f"Ошибка ретуши: {e}")
+
+
+# ---------- thinking indicator ----------
+async def _thinking_indicator(bot: Bot, chat_id: int, stop_event: asyncio.Event):
+    """Показывает 'бот печатает…' пока не установлен stop_event."""
+    try:
+        while not stop_event.is_set():
+            await bot.send_chat_action(chat_id, ChatAction.TYPING)
+            await asyncio.sleep(4)
+    except Exception:
+        pass
+
+async def run_with_thinking(bot: Bot, chat_id: int, coro):
+    """Оборачивает долгую операцию с индикатором печати."""
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(_thinking_indicator(bot, chat_id, stop_event))
+    try:
+        result = await coro
+        return result
+    finally:
+        stop_event.set()
+        await asyncio.sleep(0.1)
+        task.cancel()
 
 # ---------- commands ----------
 @dp.message(Command("start"))
@@ -802,7 +826,7 @@ async def handle_photo(message: Message, bot: Bot):
         "Если это документ/скрин — извлеки ключевой текст, найди ошибки/суть и дай рекомендации.\n"
     )
     try:
-        answer = await _ask_openai_vision(prompt, image_bytes)
+        answer = await run_with_thinking(bot, message.chat.id, _ask_openai_vision(prompt, image_bytes))
     except Exception as e:
         logging.exception("OpenAI vision failed")
         await message.answer(f"OpenAI error: {e}")
@@ -844,7 +868,7 @@ async def handle_document(message: Message, bot: Bot):
         last_images[message.from_user.id] = file_bytes
         prompt = f"Пользователь прислал изображение файлом: {filename}. Распознай и помоги."
         try:
-            answer = await _ask_openai_vision(prompt, file_bytes)
+            answer = await run_with_thinking(bot, message.chat.id, _ask_openai_vision(prompt, file_bytes))
         except Exception as e:
             logging.exception("OpenAI vision failed")
             await message.answer(f"OpenAI error: {e}")
@@ -883,7 +907,7 @@ async def handle_document(message: Message, bot: Bot):
     )
 
     try:
-        answer = await _ask_openai_text(system, user)
+        answer = await run_with_thinking(bot, message.chat.id, _ask_openai_text(system, user))
     except Exception as e:
         logging.exception("OpenAI text failed")
         await message.answer(f"OpenAI error: {e}")
@@ -932,7 +956,7 @@ async def chat_gpt(message: Message):
     user = user_text + search_block
 
     try:
-        answer = await _ask_openai_text(system, user)
+        answer = await run_with_thinking(bot, message.chat.id, _ask_openai_text(system, user))
     except Exception as e:
         logging.exception("OpenAI request failed")
         await message.answer(f"OpenAI error: {e}")
