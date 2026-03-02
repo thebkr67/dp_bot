@@ -131,7 +131,22 @@ def should_use_last_image(text: str) -> bool:
     return False
 
 
+def _is_edit_intent(text: str) -> bool:
+    """Heuristic: user asks to modify the attached/last file."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    triggers = [
+        "проверь", "проверить", "простав", "заполни", "заполнить",
+        "исправ", "поправ", "замени", "заменить", "добав", "добавить",
+        "удал", "удалить", "сделай", "сделать", "сформируй", "сформировать",
+        "внеси", "внести", "пометь", "пометить",
+    ]
+    return any(k in t for k in triggers)
+
+
 # ---------- autosearch state ----------
+
 _last_search_at: dict[int, float] = {}
 _search_cache: dict[str, tuple[float, list[dict]]] = {}
 
@@ -1186,7 +1201,7 @@ async def handle_document(message: Message, bot: Bot):
 
 
 @dp.message(F.text)
-async def chat_gpt(message: Message):
+async def chat_gpt(message: Message, bot: Bot):
     await _react_ok(message)
     user_text = (message.text or "").strip()
     if not user_text:
@@ -1217,6 +1232,53 @@ async def chat_gpt(message: Message):
     # Команды не трогаем
     if user_text.startswith("/"):
         return
+
+    # --- REPLY CONTEXT (when user replies to a message) ---
+    # If user replies to a message with a file/photo/text, treat it as the context for the current request:
+    # - remember that file/photo as "last"
+    # - merge text from replied-to message + current message
+    replied = message.reply_to_message
+    if replied:
+        base_text = ((replied.text or replied.caption) or "").strip()
+
+        # If replied message contains a document — remember it as last file
+        if replied.document:
+            try:
+                filename = replied.document.file_name or "file"
+                ext = _ext(filename)
+                mime = replied.document.mime_type or ""
+                file_bytes, _ = await _download_telegram_file(bot, replied.document.file_id)
+                if len(file_bytes) <= MAX_FILE_BYTES:
+                    last_files[user_id] = LastFile(filename=filename, ext=ext, mime=mime, data=file_bytes)
+            except Exception:
+                logging.exception("Failed to ingest replied document")
+
+        # If replied message contains a photo — remember it as last image
+        if replied.photo:
+            try:
+                photo = replied.photo[-1]
+                image_bytes, _ = await _download_telegram_file(bot, photo.file_id)
+                last_images[user_id] = image_bytes
+                last_image_ts[user_id] = time.time()
+            except Exception:
+                logging.exception("Failed to ingest replied photo")
+
+        # Merge instruction/context
+        if base_text:
+            user_text = base_text + "\n\nДОПОЛНИТЕЛЬНО ОТ ПОЛЬЗОВАТЕЛЯ:\n" + user_text
+
+        # If we have a file from reply (or already), and the user intent looks like editing — run /edit automatically
+        lf = last_files.get(user_id)
+        if lf and _is_edit_intent(user_text):
+            try:
+                message.text = f"/edit {user_text}"
+                await edit_last_file(message, bot)
+                return
+            except Exception as e:
+                logging.exception("Auto /edit (reply context) failed")
+                await message.answer(f"Не смог применить правки. Ошибка: {e}")
+                return
+
 
     # --- QUESTION TO LAST IMAGE (photo + text) ---
     src_img = last_images.get(user_id)
