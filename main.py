@@ -760,7 +760,11 @@ async def cmd_wb_retouch(message: Message):
         return
 
     try:
-        img_bytes = await run_with_thinking(message.bot, message.chat.id, retouch_for_wb(src))
+        img_bytes = await run_with_thinking(
+    callback.message.bot,
+    callback.message.chat.id,
+    retouch_for_wb(src)
+)
         path = _save_bytes_to_tmp(f"wb_retouch_{int(time.time())}.png", img_bytes)
         await message.answer_document(FSInputFile(path), caption="WB ретушь готова ✅")
     except Exception as e:
