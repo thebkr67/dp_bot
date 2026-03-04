@@ -17,9 +17,6 @@ from aiogram.types import Message, FSInputFile, CallbackQuery, ReactionTypeEmoji
 from aiogram.enums import ChatAction
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-
-from openai import OpenAI
-
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 from openpyxl import load_workbook, Workbook
@@ -29,8 +26,12 @@ from PIL import Image
 # ---------- setup ----------
 load_dotenv()
 
+# DeepSeek (text LLM)
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_TEXT_MODEL = os.getenv("DEEPSEEK_TEXT_MODEL", "deepseek-chat")
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 
 DEEPAI_API_KEY = os.getenv("DEEPAI_API_KEY")
@@ -53,17 +54,34 @@ if not DEEPAI_API_KEY:
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set")
+
+if not DEEPSEEK_API_KEY:
+    raise RuntimeError("DEEPSEEK_API_KEY is not set (required for text)")
 
 logging.basicConfig(level=logging.INFO)
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+async def deepseek_chat_complete(model: str, messages: list[dict]) -> str:
+    """
+    Minimal DeepSeek Chat Completions call (OpenAI-compatible schema) via HTTP.
+    """
+    url = DEEPSEEK_BASE_URL.rstrip("/") + "/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {"model": model, "messages": messages}
+    async with httpx.AsyncClient(timeout=60) as client_http:
+        r = await client_http.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+    try:
+        return (data["choices"][0]["message"]["content"] or "").strip()
+    except Exception:
+        raise RuntimeError(f"Unexpected DeepSeek response: {data}")
+
 dp = Dispatcher()
 
-TEXT_MODEL = "gpt-4o-mini"
-VISION_MODEL = "gpt-4o-mini"
-
+TEXT_MODEL = DEEPSEEK_TEXT_MODEL
 MAX_FILE_BYTES = 12 * 1024 * 1024  # 12 MB
 
 # ---------- autosearch settings ----------
@@ -322,35 +340,14 @@ async def _download_telegram_file(bot: Bot, file_id: str) -> Tuple[bytes, str]:
     return buf.getvalue(), (file.file_path or "")
 
 
-async def _ask_openai_text(system: str, user: str) -> str:
-    resp = client.chat.completions.create(
+async def _ask_llm_text(system: str, user: str) -> str:
+    return await deepseek_chat_complete(
         model=TEXT_MODEL,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
     )
-    return resp.choices[0].message.content or ""
-
-
-async def _ask_openai_vision(prompt: str, image_bytes: bytes) -> str:
-    mime = _detect_image_mime_from_bytes(image_bytes)
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    data_url = f"data:{mime};base64,{b64}"
-
-    r = client.responses.create(
-        model=VISION_MODEL,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": data_url},
-                ],
-            }
-        ],
-    )
-    return (r.output_text or "").strip()
 
 
 def _save_bytes_to_tmp(filename: str, data: bytes) -> str:
@@ -393,7 +390,7 @@ async def _edit_text_like(original_text: str, instructions: str) -> str:
         f"ИНСТРУКЦИЯ:\n{instructions}\n\n"
         f"ИСТОЧНИК:\n-----\n{_safe_truncate(original_text)}\n-----\n"
     )
-    return await _ask_openai_text(system, user)
+    return await _ask_llm_text(system, user)
 
 
 async def _edit_docx_bytes(data: bytes, instructions: str) -> Tuple[bytes, str]:
@@ -413,7 +410,7 @@ async def _edit_xlsx_bytes(data: bytes, instructions: str) -> Tuple[bytes, str]:
         f"ТАБЛИЦА TSV:\n-----\n{preview}\n-----\n"
         "Требования: сохраняй структуру таблицы, не добавляй лишних комментариев."
     )
-    tsv = await _ask_openai_text(system, user)
+    tsv = await _ask_llm_text(system, user)
     tsv = tsv.strip().strip("```").strip()
     return _build_xlsx_from_tsv(tsv), "xlsx"
 
@@ -979,7 +976,7 @@ async def make_xlsx(message: Message):
         "Первая строка — заголовки."
     )
     user = f"Сгенерируй таблицу по запросу:\n{prompt}"
-    tsv = await _ask_openai_text(system, user)
+    tsv = await _ask_llm_text(system, user)
     tsv = tsv.strip().strip("```").strip()
 
     out_bytes = _build_xlsx_from_tsv(tsv)
@@ -996,7 +993,7 @@ async def make_docx(message: Message):
         return
 
     system = "Сгенерируй документ по запросу. Верни ТОЛЬКО чистый текст документа, без markdown."
-    text = await _ask_openai_text(system, prompt)
+    text = await _ask_llm_text(system, prompt)
 
     out_bytes = _build_docx_from_text(text)
     out_name = "generated.docx"
@@ -1012,7 +1009,7 @@ async def make_txt(message: Message):
         return
 
     system = "Сгенерируй текст по запросу. Верни ТОЛЬКО результат, без пояснений."
-    text = await _ask_openai_text(system, prompt)
+    text = await _ask_llm_text(system, prompt)
 
     out_bytes = (text or "").encode("utf-8")
     out_name = "generated.txt"
@@ -1068,7 +1065,7 @@ async def cmd_research(message: Message):
     user = "Запрос: " + q + "\n\n" + format_results_for_prompt(results)
 
     try:
-        summary = await _ask_openai_text(system, user)
+        summary = await _ask_llm_text(system, user)
         await message.answer("🧠 Сводка:\n\n" + summary)
     except Exception as e:
         logging.exception("OpenAI summary failed")
@@ -1085,27 +1082,12 @@ async def handle_photo(message: Message, bot: Bot):
     last_images[message.from_user.id] = image_bytes
     last_image_ts[message.from_user.id] = time.time()
 
-    user_question = (message.caption or "").strip()
-    if user_question:
-        prompt = (
-            "Ты анализируешь изображение и отвечаешь на вопрос пользователя. "
-            "Отвечай по делу, без воды. Если по фото нельзя понять — скажи, что именно не видно.\n\n"
-            f"ВОПРОС ПОЛЬЗОВАТЕЛЯ: {user_question}"
-        )
-    else:
-        prompt = (
-            "Распознай, что на изображении, и помоги пользователю.\n"
-            "Если это документ/скрин — извлеки ключевой текст, найди ошибки/суть и дай рекомендации.\n"
-        )
-    try:
-        answer = await run_with_thinking(message.bot, message.chat.id, _ask_openai_vision(prompt, image_bytes))
-    except Exception as e:
-        logging.exception("OpenAI vision failed")
-        await message.answer(f"OpenAI error: {e}")
-        return
-
-    reference.response = answer
-    await message.answer(answer)
+    await message.answer(
+        "Фото получил ✅
+"
+        "В этой версии бота нет анализа изображений (vision), но я могу обработать фото: "
+        "✨ улучшить / 🛍️ WB ретушь / 🎥 видео."
+    )
     await message.answer("Что сделать с фото?", reply_markup=_image_action_keyboard())
 
 
@@ -1137,24 +1119,17 @@ async def handle_document(message: Message, bot: Bot):
         await edit_last_file(message, bot)
         return
 
-    if ext in {".png", ".jpg", ".jpeg", ".webp"} or mime.startswith("image/"):
+        if ext in {".png", ".jpg", ".jpeg", ".webp"} or mime.startswith("image/"):
         last_images[message.from_user.id] = file_bytes
         last_image_ts[message.from_user.id] = time.time()
-        user_question = (message.caption or "").strip()
-        if user_question:
-            prompt = (
-                "Ты анализируешь изображение и отвечаешь на вопрос пользователя. "
-                "Отвечай по делу, без воды. Если по фото нельзя понять — скажи, что именно не видно.\n\n"
-                f"ВОПРОС ПОЛЬЗОВАТЕЛЯ: {user_question}"
-            )
-        else:
-            prompt = f"Пользователь прислал изображение файлом: {filename}. Распознай и помоги."
-        try:
-            answer = await run_with_thinking(message.bot, message.chat.id, _ask_openai_vision(prompt, file_bytes))
-        except Exception as e:
-            logging.exception("OpenAI vision failed")
-            await message.answer(f"OpenAI error: {e}")
-            return
+        await message.answer(
+            f"Изображение «{filename}» получил ✅
+    "
+            "Vision (анализ) отключён, но я могу обработать: ✨ улучшить / 🛍️ WB ретушь / 🎥 видео."
+        )
+        await message.answer("Что сделать с изображением?", reply_markup=_image_action_keyboard())
+        await message.answer("Файл запомнил. Если нужно изменить — напиши /edit <что поменять>.")
+        return
         reference.response = answer
         await message.answer(answer)
         await message.answer("Что сделать с изображением?", reply_markup=_image_action_keyboard())
@@ -1189,7 +1164,7 @@ async def handle_document(message: Message, bot: Bot):
     )
 
     try:
-        answer = await run_with_thinking(message.bot, message.chat.id, _ask_openai_text(system, user))
+        answer = await run_with_thinking(message.bot, message.chat.id, _ask_llm_text(system, user))
     except Exception as e:
         logging.exception("OpenAI text failed")
         await message.answer(f"OpenAI error: {e}")
@@ -1291,7 +1266,7 @@ async def chat_gpt(message: Message, bot: Bot):
             f"ВОПРОС ПОЛЬЗОВАТЕЛЯ: {user_text}"
         )
         try:
-            answer = await run_with_thinking(message.bot, message.chat.id, _ask_openai_vision(prompt, src_img))
+        await message.answer("Vision отключён в этой версии (без OpenAI). Могу: ✨ улучшить / 🛍️ WB ретушь / 🎥 видео.")
         except Exception as e:
             logging.exception("OpenAI vision failed (last image Q)")
             await message.answer(f"OpenAI error: {e}")
@@ -1328,7 +1303,7 @@ async def chat_gpt(message: Message, bot: Bot):
     user = user_text + search_block
 
     try:
-        answer = await run_with_thinking(message.bot, message.chat.id, _ask_openai_text(system, user))
+        answer = await run_with_thinking(message.bot, message.chat.id, _ask_llm_text(system, user))
     except Exception as e:
         logging.exception("OpenAI request failed")
         await message.answer(f"OpenAI error: {e}")
