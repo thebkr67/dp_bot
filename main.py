@@ -31,7 +31,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # DeepSeek (text)
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")  # change if you use a proxy
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
 # Serper (optional web search)
@@ -40,7 +40,7 @@ SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 # DeepAI (optional image tools)
 DEEPAI_API_KEY = os.getenv("DEEPAI_API_KEY")
 DEEPAI_TIMEOUT_SEC = int(os.getenv("DEEPAI_TIMEOUT_SEC", "120"))
-ENHANCE_DEFAULT_SCALE = int(os.getenv("ENHANCE_DEFAULT_SCALE", "2"))  # 2 or 4
+ENHANCE_DEFAULT_SCALE = int(os.getenv("ENHANCE_DEFAULT_SCALE", "2"))
 
 # fal.ai (optional img2vid)
 FAL_KEY = os.getenv("FAL_KEY") or os.getenv("FAL_API_KEY")
@@ -48,6 +48,8 @@ FAL_QUEUE_BASE = os.getenv("FAL_QUEUE_BASE", "https://queue.fal.run")
 PIKA_IMAGE2VIDEO_MODEL = os.getenv("PIKA_IMAGE2VIDEO_MODEL", "fal-ai/pika/v2.2/image-to-video")
 PIKA_POLL_INTERVAL_SEC = int(os.getenv("PIKA_POLL_INTERVAL_SEC", "5"))
 PIKA_TASK_TIMEOUT_SEC = int(os.getenv("PIKA_TASK_TIMEOUT_SEC", "600"))
+DEFAULT_VIDEO_PROMPT = os.getenv("DEFAULT_VIDEO_PROMPT",
+                                  "create a short video from this image, make it come alive with gentle motion")
 
 MAX_FILE_BYTES = 12 * 1024 * 1024  # 12 MB
 
@@ -154,14 +156,12 @@ def _safe_truncate(s: str, max_chars: int = 45000) -> str:
     return s[:max_chars] + "\n…(обрезано)…"
 
 async def _react_ok(message: Message):
-    # minimal: just show typing
     try:
         await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     except Exception:
         pass
 
 async def run_with_thinking(bot: Bot, chat_id: int, coro):
-    """Shows typing while awaiting a coroutine."""
     task = asyncio.create_task(coro)
     while not task.done():
         try:
@@ -344,35 +344,35 @@ async def clear(message: Message):
 
 @dp.message(Command("search"))
 async def cmd_search(message: Message):
-    q = (message.text or "").replace("/search", "", 1).strip()
-    if not q:
-        await message.answer("Напиши так: /search запрос")
-        return
-    if not SERPER_API_KEY:
-        await message.answer("SERPER_API_KEY не задан — поиск отключён.")
-        return
     try:
+        q = (message.text or "").replace("/search", "", 1).strip()
+        if not q:
+            await message.answer("Напиши так: /search запрос")
+            return
+        if not SERPER_API_KEY:
+            await message.answer("SERPER_API_KEY не задан — поиск отключён.")
+            return
         results = await serper_search(q, num=5)
+        if not results:
+            await message.answer("Ничего не нашёл. Попробуй переформулировать.")
+            return
+        await message.answer(format_search_results(results))
     except Exception as e:
+        logging.exception("Search failed")
         await message.answer(f"Ошибка поиска: {e}")
-        return
-    if not results:
-        await message.answer("Ничего не нашёл. Попробуй переформулировать.")
-        return
-    await message.answer(format_search_results(results))
 
 @dp.message(Command("enhance"))
 async def cmd_enhance(message: Message):
-    src = last_images.get(message.from_user.id)
-    if not src:
-        await message.answer("Сначала пришли фото.")
-        return
-    if not DEEPAI_API_KEY:
-        await message.answer("DEEPAI_API_KEY не задан — улучшение отключено.")
-        return
-    m = re.search(r"\b(2|4)\s*x?\b", (message.text or ""))
-    scale = int(m.group(1)) if m else ENHANCE_DEFAULT_SCALE
     try:
+        src = last_images.get(message.from_user.id)
+        if not src:
+            await message.answer("Сначала пришли фото.")
+            return
+        if not DEEPAI_API_KEY:
+            await message.answer("DEEPAI_API_KEY не задан — улучшение отключено.")
+            return
+        m = re.search(r"\b(2|4)\s*x?\b", (message.text or ""))
+        scale = int(m.group(1)) if m else ENHANCE_DEFAULT_SCALE
         await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_DOCUMENT)
         out = await run_with_thinking(message.bot, message.chat.id, enhance_image(src, scale=scale))
         path = _save_bytes_to_tmp(f"enhanced_{int(time.time())}.png", out)
@@ -383,18 +383,18 @@ async def cmd_enhance(message: Message):
 
 @dp.message(Command("img2vid"))
 async def cmd_img2vid(message: Message):
-    prompt = (message.text or "").replace("/img2vid", "", 1).strip()
-    if not prompt:
-        await message.answer("Напиши так: /img2vid описание (движение/камера/стиль).")
-        return
-    src = last_images.get(message.from_user.id)
-    if not src:
-        await message.answer("Сначала пришли фото.")
-        return
-    if not FAL_KEY:
-        await message.answer("FAL_KEY не задан — видео отключено.")
-        return
     try:
+        prompt = (message.text or "").replace("/img2vid", "", 1).strip()
+        if not prompt:
+            await message.answer("Напиши так: /img2vid описание (движение/камера/стиль).")
+            return
+        src = last_images.get(message.from_user.id)
+        if not src:
+            await message.answer("Сначала пришли фото.")
+            return
+        if not FAL_KEY:
+            await message.answer("FAL_KEY не задан — видео отключено.")
+            return
         await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
         video_bytes = await run_with_thinking(message.bot, message.chat.id, pika_image_bytes_to_video(src, prompt))
         path = _save_bytes_to_tmp(f"pika_{int(time.time())}.mp4", video_bytes)
@@ -432,17 +432,17 @@ async def _edit_xlsx_bytes(data: bytes, instructions: str) -> bytes:
 
 @dp.message(Command("edit"))
 async def edit_last_file(message: Message):
-    user_id = message.from_user.id
-    instructions = (message.text or "").replace("/edit", "", 1).strip()
-    if not instructions:
-        await message.answer("Напиши инструкцию так: /edit что именно поменять в последнем файле")
-        return
-    lf = last_files.get(user_id)
-    if not lf:
-        await message.answer("Сначала пришли файл, который нужно изменить.")
-        return
-
     try:
+        user_id = message.from_user.id
+        instructions = (message.text or "").replace("/edit", "", 1).strip()
+        if not instructions:
+            await message.answer("Напиши инструкцию так: /edit что именно поменять в последнем файле")
+            return
+        lf = last_files.get(user_id)
+        if not lf:
+            await message.answer("Сначала пришли файл, который нужно изменить.")
+            return
+
         if lf.ext in {".txt", ".csv", ".json", ".md", ".log"}:
             src = _extract_text_from_plain(lf.data)
             edited = await _edit_text_like(src, instructions)
@@ -484,8 +484,12 @@ async def edit_last_file(message: Message):
 @dp.message(F.photo)
 async def handle_photo(message: Message, bot: Bot):
     await _react_ok(message)
-    photo = message.photo[-1]
-    image_bytes, _ = await _download_telegram_file(bot, photo.file_id)
+    try:
+        photo = message.photo[-1]
+        image_bytes, _ = await _download_telegram_file(bot, photo.file_id)
+    except Exception as e:
+        await message.answer(f"Не удалось загрузить фото: {e}")
+        return
     last_images[message.from_user.id] = image_bytes
 
     await message.answer("Фото получил ✅")
@@ -493,37 +497,51 @@ async def handle_photo(message: Message, bot: Bot):
 
 @dp.callback_query(F.data == ENHANCE_CB)
 async def cb_enhance_last(callback: CallbackQuery):
-    src = last_images.get(callback.from_user.id)
-    if not src:
-        await callback.message.answer("Не нашёл последнее фото. Пришли фото ещё раз.")
-        await callback.answer()
-        return
-    if not DEEPAI_API_KEY:
-        await callback.message.answer("DEEPAI_API_KEY не задан — улучшение отключено.")
-        await callback.answer()
-        return
-    await callback.answer("Улучшаю…")
     try:
-        out = await run_with_thinking(callback.message.bot, callback.message.chat.id, enhance_image(src, scale=ENHANCE_DEFAULT_SCALE))
+        src = last_images.get(callback.from_user.id)
+        if not src:
+            await callback.message.answer("Не нашёл последнее фото. Пришли фото ещё раз.")
+            await callback.answer()
+            return
+        if not DEEPAI_API_KEY:
+            await callback.message.answer("DEEPAI_API_KEY не задан — улучшение отключено.")
+            await callback.answer()
+            return
+        await callback.answer("Улучшаю…")
+        out = await run_with_thinking(callback.message.bot, callback.message.chat.id,
+                                      enhance_image(src, scale=ENHANCE_DEFAULT_SCALE))
         path = _save_bytes_to_tmp(f"enhanced_{int(time.time())}.png", out)
         await callback.message.answer_document(FSInputFile(path), caption="Улучшил ✅")
     except Exception as e:
         logging.exception("Callback enhance failed")
         await callback.message.answer(f"Ошибка улучшения: {e}")
+    finally:
+        await callback.answer()
 
 @dp.callback_query(F.data == VIDEO_CB)
 async def cb_video_last(callback: CallbackQuery):
-    if not FAL_KEY:
-        await callback.message.answer("FAL_KEY не задан — видео отключено.")
+    try:
+        user_id = callback.from_user.id
+        if not FAL_KEY:
+            await callback.message.answer("FAL_KEY не задан — видео отключено.")
+            await callback.answer()
+            return
+        src = last_images.get(user_id)
+        if not src:
+            await callback.message.answer("Не нашёл последнее фото. Пришли фото ещё раз.")
+            await callback.answer()
+            return
+        await callback.answer("Генерирую видео...")
+        prompt = DEFAULT_VIDEO_PROMPT
+        video_bytes = await run_with_thinking(callback.message.bot, callback.message.chat.id,
+                                              pika_image_bytes_to_video(src, prompt))
+        path = _save_bytes_to_tmp(f"pika_{int(time.time())}.mp4", video_bytes)
+        await callback.message.answer_video(FSInputFile(path), caption="Видео готово ✅")
+    except Exception as e:
+        logging.exception("Video generation failed")
+        await callback.message.answer(f"Ошибка генерации видео: {e}")
+    finally:
         await callback.answer()
-        return
-    src = last_images.get(callback.from_user.id)
-    if not src:
-        await callback.message.answer("Не нашёл последнее фото. Пришли фото ещё раз.")
-        await callback.answer()
-        return
-    await callback.answer("Пришли описание движения/камеры текстом и я соберу видео командой /img2vid …")
-    # (упрощено) — делаем через команду /img2vid
 
 @dp.message(F.document)
 async def handle_document(message: Message, bot: Bot):
@@ -533,7 +551,12 @@ async def handle_document(message: Message, bot: Bot):
     ext = _ext(filename)
     mime = doc.mime_type or ""
 
-    file_bytes, _ = await _download_telegram_file(bot, doc.file_id)
+    try:
+        file_bytes, _ = await _download_telegram_file(bot, doc.file_id)
+    except Exception as e:
+        await message.answer(f"Не удалось загрузить файл: {e}")
+        return
+
     if len(file_bytes) > MAX_FILE_BYTES:
         await message.answer("Файл слишком большой. Пришли поменьше (до ~12MB).")
         return
@@ -545,7 +568,7 @@ async def handle_document(message: Message, bot: Bot):
         instructions = caption[5:].strip()
         message.text = f"/edit {instructions}"
         await edit_last_file(message)
-        return
+        return  # важно: не продолжаем обработку
 
     # image-as-document
     if ext in {".png", ".jpg", ".jpeg", ".webp"} or mime.startswith("image/"):
@@ -593,40 +616,39 @@ async def handle_document(message: Message, bot: Bot):
 
 @dp.message(F.text)
 async def chat(message: Message, bot: Bot):
-    await _react_ok(message)
-    user_text = (message.text or "").strip()
-    if not user_text or user_text.startswith("/"):
-        return
-
-    # If user wrote after sending photo: tell about vision limitation
-    if last_images.get(message.from_user.id) and re.search(r"\b(что|кто|где|почему|как|какой|сколько)\b|\?", user_text.lower()):
-        await message.answer(
-            "Если это вопрос к фото — в этой версии анализа изображений нет.\n"
-            "Но могу улучшить фото (/enhance) или сделать видео (/img2vid)."
-        )
-        return
-
-    # Optional autosearch: if SERPER is configured and user asks for sources
-    search_block = ""
-    if SERPER_API_KEY and any(k in user_text.lower() for k in ["найди", "источник", "ссылка", "пруф", "актуал", "сейчас", "новост"]):
-        try:
-            results = await serper_search(user_text, num=5)
-            if results:
-                search_block = "\n\nРЕЗУЛЬТАТЫ ПОИСКА:\n" + format_results_for_prompt(results)
-        except Exception:
-            logging.exception("Autosearch failed")
-
-    system = "Отвечай по делу, человеческим языком. Если есть результаты поиска — опирайся на них и добавь 2–5 ссылок."
-    user = user_text + search_block
-
     try:
-        answer = await run_with_thinking(message.bot, message.chat.id, _ask_llm_text(system, user))
-    except Exception as e:
-        await message.answer(f"LLM error: {e}")
-        return
+        await _react_ok(message)
+        user_text = (message.text or "").strip()
+        if not user_text or user_text.startswith("/"):
+            return
 
-    reference.response = answer
-    await message.answer(answer)
+        # If user wrote after sending photo: tell about vision limitation
+        if last_images.get(message.from_user.id) and re.search(r"\b(что|кто|где|почему|как|какой|сколько)\b|\?", user_text.lower()):
+            await message.answer(
+                "Если это вопрос к фото — в этой версии анализа изображений нет.\n"
+                "Но могу улучшить фото (/enhance) или сделать видео (/img2vid)."
+            )
+            return
+
+        # Optional autosearch: if SERPER is configured and user asks for sources
+        search_block = ""
+        if SERPER_API_KEY and any(k in user_text.lower() for k in ["найди", "источник", "ссылка", "пруф", "актуал", "сейчас", "новост"]):
+            try:
+                results = await serper_search(user_text, num=5)
+                if results:
+                    search_block = "\n\nРЕЗУЛЬТАТЫ ПОИСКА:\n" + format_results_for_prompt(results)
+            except Exception:
+                logging.exception("Autosearch failed")
+
+        system = "Отвечай по делу, человеческим языком. Если есть результаты поиска — опирайся на них и добавь 2–5 ссылок."
+        user = user_text + search_block
+
+        answer = await run_with_thinking(message.bot, message.chat.id, _ask_llm_text(system, user))
+        reference.response = answer
+        await message.answer(answer)
+    except Exception as e:
+        logging.exception("Unhandled error in chat")
+        await message.answer(f"Произошла внутренняя ошибка: {e}")
 
 # ---------- entrypoint ----------
 async def main():
