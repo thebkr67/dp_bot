@@ -7,7 +7,7 @@ import base64
 import logging
 import asyncio
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 import httpx
 from dotenv import load_dotenv
@@ -154,6 +154,38 @@ def _safe_truncate(s: str, max_chars: int = 45000) -> str:
     if len(s) <= max_chars:
         return s
     return s[:max_chars] + "\n…(обрезано)…"
+
+# ---------- new helper: split long message ----------
+def split_message(text: str, max_len: int = 4000) -> List[str]:
+    """
+    Разбивает длинный текст на части, не превышающие max_len символов.
+    Старается не резать слова (режет по пробелу или переносу строки).
+    """
+    if len(text) <= max_len:
+        return [text]
+
+    parts = []
+    while text:
+        if len(text) <= max_len:
+            parts.append(text)
+            break
+
+        # Ищем место разрыва: последний пробел или перенос в пределах max_len
+        split_at = max_len
+        # Пытаемся найти пробел или \n в диапазоне от max_len-200 до max_len
+        for sep in ('\n', ' '):
+            pos = text.rfind(sep, max_len - 200, max_len)
+            if pos != -1:
+                split_at = pos + 1  # включаем разделитель в текущую часть
+                break
+        else:
+            # Если подходящий разделитель не найден, режем ровно по max_len
+            split_at = max_len
+
+        parts.append(text[:split_at].rstrip())
+        text = text[split_at:].lstrip()
+
+    return parts
 
 async def _react_ok(message: Message):
     try:
@@ -356,7 +388,10 @@ async def cmd_search(message: Message):
         if not results:
             await message.answer("Ничего не нашёл. Попробуй переформулировать.")
             return
-        await message.answer(format_search_results(results))
+        text = format_search_results(results)
+        # FIX: split long message
+        for part in split_message(text):
+            await message.answer(part)
     except Exception as e:
         logging.exception("Search failed")
         await message.answer(f"Ошибка поиска: {e}")
@@ -611,7 +646,9 @@ async def handle_document(message: Message, bot: Bot):
         return
 
     reference.response = answer
-    await message.answer(answer)
+    # FIX: split long message
+    for part in split_message(answer):
+        await message.answer(part)
     await message.answer("Файл запомнил. Если нужно изменить — напиши /edit <что поменять>.")
 
 @dp.message(F.text)
@@ -645,7 +682,9 @@ async def chat(message: Message, bot: Bot):
 
         answer = await run_with_thinking(message.bot, message.chat.id, _ask_llm_text(system, user))
         reference.response = answer
-        await message.answer(answer)
+        # FIX: split long message
+        for part in split_message(answer):
+            await message.answer(part)
     except Exception as e:
         logging.exception("Unhandled error in chat")
         await message.answer(f"Произошла внутренняя ошибка: {e}")
